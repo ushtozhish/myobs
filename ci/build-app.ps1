@@ -27,6 +27,8 @@ if (-not (Test-Path (Join-Path $ldc '.myobs-patched'))) {
     if ($LASTEXITCODE) { throw 'libdatachannel clone failed' }
     git -C $ldc apply --ignore-whitespace --whitespace=nowarn (Join-Path $root 'third_party/patches/libdatachannel-0.20.2-myobs.patch')
     if ($LASTEXITCODE) { throw 'libdatachannel patch failed' }
+    git -C (Join-Path $ldc 'deps/libjuice') apply --ignore-whitespace --whitespace=nowarn (Join-Path $root 'third_party/patches/libjuice-relay-only-myobs.patch')
+    if ($LASTEXITCODE) { throw 'libjuice patch failed' }
     New-Item -ItemType File (Join-Path $ldc '.myobs-patched') | Out-Null
 }
 $mbed = Join-Path $root 'engine-build/mbedtls-3.6.7'
