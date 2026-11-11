@@ -4,7 +4,8 @@
  * Click = Preview, double click = on air by CUT, right button = properties, rename, tab, remove.
  * Tabs: «Все» plus own colour-coded tabs; an input belongs to one tab or none.
  * CUT / FADE with the fade length; + Клип / + Картинка / + Цвет.
- * Inputs, their volume and mute, and the tabs are saved and restored between starts. */
+ * Sound per input: fader, ЭФИР (into the program mix) and AFV (only while its picture is on air).
+ * Inputs, their sound settings and the tabs are saved and restored between starts. */
 #pragma once
 
 #include <obs.hpp>
@@ -174,13 +175,19 @@ public:
 			fader_ = new QSlider(Qt::Horizontal, this);
 			fader_->setRange(0, 1000);
 			fader_->setToolTip("Громкость входа");
-			mute_ = new QPushButton("M", this);
-			mute_->setObjectName("mute");
-			mute_->setCheckable(true);
-			mute_->setFixedSize(26, 20);
-			mute_->setToolTip("Выключить звук входа");
+			onAir_ = new QPushButton("ЭФИР", this);
+			onAir_->setObjectName("audioOnAir");
+			onAir_->setCheckable(true);
+			onAir_->setFixedSize(44, 20);
+			onAir_->setToolTip("Звук входа в эфире (в общем миксе)");
+			afv_ = new QPushButton("AFV", this);
+			afv_->setObjectName("afv");
+			afv_->setCheckable(true);
+			afv_->setFixedSize(36, 20);
+			afv_->setToolTip("Звук следует за картинкой: звучит, только пока вход в эфире; на FADE — плавно");
 			row->addWidget(fader_, 1);
-			row->addWidget(mute_);
+			row->addWidget(onAir_);
+			row->addWidget(afv_);
 			left->addLayout(row);
 		}
 		outer->addLayout(left);
@@ -214,7 +221,8 @@ public:
 	QWidget *Thumb() const { return thumb_; }
 	obs_source_t *Scene() const { return scene_; }
 	QSlider *Fader() const { return fader_; }
-	QPushButton *Mute() const { return mute_; }
+	QPushButton *OnAir() const { return onAir_; }
+	QPushButton *Afv() const { return afv_; }
 	MeterBar *Meter() const { return meter_; }
 
 	std::function<void(int)> onClick, onDoubleClick, onMenu;
@@ -261,7 +269,8 @@ private:
 	QLabel *number_ = nullptr;
 	QLabel *name_ = nullptr;
 	QSlider *fader_ = nullptr;
-	QPushButton *mute_ = nullptr;
+	QPushButton *onAir_ = nullptr;
+	QPushButton *afv_ = nullptr;
 	MeterBar *meter_ = nullptr;
 	QColor tabColor_;
 	const char *state_ = "";
@@ -410,6 +419,8 @@ private:
 		QString type; // clip | image | color
 		QString name;
 		QString tab; // empty = no tab
+		bool audioOnAir = true;
+		bool afv = true;
 		OBSSourceAutoRelease source;
 		std::unique_ptr<InputAudio> audio;
 	};
@@ -456,7 +467,7 @@ private:
 	}
 
 	bool Add(const QString &type, const QString &name, obs_data_t *settings, const QString &tab, double volume,
-		 bool muted, bool save = true)
+		 bool audioOnAir, bool afv, bool save = true)
 	{
 		OBSSourceAutoRelease src = obs_source_create(SourceId(type), name.toUtf8().constData(), settings, nullptr);
 		if (!src) {
@@ -464,10 +475,11 @@ private:
 			return false;
 		}
 		obs_source_set_volume(src, (float)volume);
-		obs_source_set_muted(src, muted);
 		const bool hasAudio = (obs_source_get_output_flags(src) & OBS_SOURCE_AUDIO) != 0;
-		sw_->AddInput(src, name.toStdString());
-		Input in{type, name, tab, std::move(src), nullptr};
+		const int index = sw_->AddInput(src, name.toStdString());
+		sw_->SetAudioOnAir(index, audioOnAir);
+		sw_->SetAudioAfv(index, afv);
+		Input in{type, name, tab, audioOnAir, afv, std::move(src), nullptr};
 		if (hasAudio)
 			in.audio = std::make_unique<InputAudio>(in.source);
 		inputs_.push_back(std::move(in));
@@ -483,7 +495,7 @@ private:
 		for (const QString &f : files) {
 			OBSDataAutoRelease s = obs_data_create();
 			obs_data_set_string(s, "file", f.toUtf8().constData());
-			Add(type, QFileInfo(f).completeBaseName(), s, CurrentTab(), 1.0, false);
+			Add(type, QFileInfo(f).completeBaseName(), s, CurrentTab(), 1.0, true, true);
 		}
 	}
 
@@ -514,7 +526,7 @@ private:
 			return;
 		OBSDataAutoRelease s = obs_data_create();
 		SetColor(s, c);
-		Add("color", QString("Цвет %1").arg(c.name()), s, CurrentTab(), 1.0, false);
+		Add("color", QString("Цвет %1").arg(c.name()), s, CurrentTab(), 1.0, true, true);
 	}
 
 	/* Live device input: created, then its settings dialog; Cancel on creation removes it again. */
@@ -532,7 +544,7 @@ private:
 			if (in.type == type)
 				n++;
 		OBSDataAutoRelease s = obs_data_create();
-		if (!Add(type, QString("%1 %2").arg(base).arg(n), s, CurrentTab(), 1.0, false))
+		if (!Add(type, QString("%1 %2").arg(base).arg(n), s, CurrentTab(), 1.0, true, true, false))
 			return;
 		const int index = (int)inputs_.size() - 1;
 		PropertiesDialog d(inputs_[index].source, QString("Свойства — %1").arg(inputs_[index].name), this);
@@ -605,13 +617,19 @@ private:
 			};
 			if (in.audio) {
 				t->Fader()->setValue((int)std::lround(in.audio->Deflection() * 1000.0f));
-				t->Mute()->setChecked(obs_source_muted(in.source));
-				obs_source_t *src = in.source;
+				t->OnAir()->setChecked(in.audioOnAir);
+				t->Afv()->setChecked(in.afv);
 				InputAudio *audio = in.audio.get();
 				connect(t->Fader(), &QSlider::valueChanged, this, [audio](int v) { audio->SetDeflection(v / 1000.0f); });
 				connect(t->Fader(), &QSlider::sliderReleased, this, [this]() { SaveInputs(); });
-				connect(t->Mute(), &QPushButton::toggled, this, [this, src](bool m) {
-					obs_source_set_muted(src, m);
+				connect(t->OnAir(), &QPushButton::toggled, this, [this, i](bool v) {
+					inputs_[i].audioOnAir = v;
+					sw_->SetAudioOnAir(i, v);
+					SaveInputs();
+				});
+				connect(t->Afv(), &QPushButton::toggled, this, [this, i](bool v) {
+					inputs_[i].afv = v;
+					sw_->SetAudioAfv(i, v);
 					SaveInputs();
 				});
 			}
@@ -896,7 +914,8 @@ private:
 			o["name"] = in.name;
 			o["tab"] = in.tab;
 			o["volume"] = (double)obs_source_get_volume(in.source);
-			o["muted"] = obs_source_muted(in.source);
+			o["audioOnAir"] = in.audioOnAir;
+			o["afv"] = in.afv;
 			o["settings"] = QJsonDocument::fromJson(QByteArray(obs_data_get_json(s))).object();
 			arr.append(o);
 		}
@@ -911,7 +930,7 @@ private:
 			const QByteArray json = QJsonDocument(o["settings"].toObject()).toJson(QJsonDocument::Compact);
 			OBSDataAutoRelease s = obs_data_create_from_json(json.constData());
 			Add(o["type"].toString(), o["name"].toString(), s, o["tab"].toString(), o["volume"].toDouble(1.0),
-			    o["muted"].toBool(false), false);
+			    o["audioOnAir"].toBool(true), o["afv"].toBool(true), false);
 		}
 	}
 

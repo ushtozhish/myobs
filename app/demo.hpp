@@ -128,7 +128,8 @@ inline void Prepare(const QString &dir)
 		o["name"] = QString::fromUtf8(p.name);
 		o["tab"] = QString::fromUtf8(p.tab);
 		o["volume"] = 1.0;
-		o["muted"] = false;
+		o["audioOnAir"] = true;
+		o["afv"] = true;
 		o["settings"] = QJsonObject{{"file", file}};
 		inputs.append(o);
 	}
@@ -137,7 +138,8 @@ inline void Prepare(const QString &dir)
 	color["name"] = "Чёрный";
 	color["tab"] = "";
 	color["volume"] = 1.0;
-	color["muted"] = false;
+	color["audioOnAir"] = true;
+	color["afv"] = true;
 	color["settings"] = QJsonObject{{"color", (qint64)0xFF000000LL}, {"width", 1920}, {"height", 1080}};
 	inputs.append(color);
 	QSettings s;
