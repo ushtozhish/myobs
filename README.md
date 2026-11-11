@@ -1,98 +1,17 @@
 # MyOBS
 
-**Программа для прямых эфиров под Windows: переключение как в vMix, надёжность как у эфирного железа.**
-Открытый проект. Построен на движке OBS (libobs) как на библиотеке. Интерфейс, переключатель,
-воспроизведение клипов, звук и триггеры — свои.
+**English** · [Русский](README.ru.md)
 
-> Статус: **идёт разработка** (этап 1 из 5). Картинки ниже — **концепт интерфейса**, а не
-> снимки готовой программы. Готовые сборки появятся во вкладке Actions / Releases.
+**A live production switcher for Windows: vMix-style switching, broadcast-hardware reliability.**
 
-![Вертикальный проект 9:16](docs/concept/vertical.png)
+> Status: **in development** (stage 1 of 5). The images below are **interface concepts**, not
+> screenshots of the finished program. Builds appear under Actions / Releases.
 
-## Зачем ещё одна программа
-
-OBS хорош для одного стримера, но в живом эфире с несколькими камерами, клипами, звонками и
-LED-экранами ему мешают собственные решения. Мы их измерили автотестом: на каждом переключении
-на обычный видеоклип OBS выдаёт в эфир пустой кадр — тот самый «микроплан». MyOBS устроен
-иначе:
-
-- **Эфир — это святое.** Всё, что не эфир (миниатюры, мультивью, экраны), уступает ему кадр.
-- **Клипы как в монтажке.** Каждый такт эфира вход отдаёт кадр *по номеру* из заранее
-  декодированного запаса. Пустой или чужой кадр невозможен по конструкции. Пауза = номер
-  перестаёт расти, поэтому клип продолжает ровно с того кадра, на котором ушёл из эфира.
-- **Переключение по такту.** CUT, наплыв и Merge срабатывают на границе кадра. Клик во время
-  перехода не теряется.
-- **Рабочий кодек — стандартный H.264** (ключевой кадр каждые 10 кадров, без B-кадров):
-  мгновенный переход к любому кадру, декодирование на видеоблоке NVIDIA, без сторонних кодеков.
-- **Звук на том же счёте кадров**, что и картинка: после пауз и перемоток не разъезжается.
-- **Только дискретная видеокарта** для рендера, даже если главный монитор подключён к встроенной.
-
-## Что будет в программе
-
-| Область | Возможности |
-|---|---|
-| Переключатель | Preview / Program, CUT, Fade, Merge (картинка-в-картинке ↔ полный экран), стингеры, очередь кликов |
-| Входы | Клип (рабочий кодек), камера, DeckLink, NDI, картинка, браузер, звонок (WebRTC), композиция; каждый вход — сцена со слоями |
-| Плитки | Клик по картинке — в эфир, по названию — в Preview; живая миниатюра, уровень и фейдер звука, кнопки наложений 1–4, ● REC |
-| Вкладки | Камеры, Медиа, Звонки, Композиции — свой цвет и размер плиток |
-| Звук | Шины Master / A / B (устройство или звонок), PFL, «звук следует за видео», шумодав, гейт, эхоподавление на звонках |
-| Наложения | 4 канала с плавным появлением |
-| Экраны | Любой источник на любой монитор или LED (как Fullscreen в vMix), масштаб, управление триггерами |
-| Триггеры | События входа (ушёл в эфир, ушёл из эфира, осталось N секунд, видео закончилось) → действия со звуком, экранами, наложениями |
-| Площадки | Мультистрим: YouTube и Telegram через API, Instagram и TikTok по ключу; общий чат, вывод сообщений в наложение |
-| Запись | Рекордер эфира и входов, файл не теряется при сбое |
-| Формат | Один на проект: 16:9 или 9:16 |
-| Цвет и ключ | Lift / Gamma / Gain / Offset с RGB+Y, кривые, LUT, кеинг, деинтерлейс, звуковые эффекты на входе |
-| Управление | Горячие клавиши и OSC для всех функций через единую шину команд |
-| Нагрузка | Монитор нагрузки и аналитика входов (опоздания, потери, буфер) |
-| MyOBS Encoder | Отдельная программа: перекодирует материалы в рабочий кодек в фоне, не мешая эфиру |
-
-### Концепт интерфейса
-
-| | |
-|---|---|
-| ![Плитка](docs/concept/tile.png) | ![Композиция и Merge](docs/concept/compose.png) |
-| Плитка входа | Композиции и переход Merge |
-| ![Триггеры](docs/concept/triggers.png) | ![Стримы](docs/concept/streams.png) |
-| Триггеры | Мультистрим |
-
-![Настройки входа](docs/concept/input.png)
-
-## План
-
-1. **Каркас** — движок на дискретной видеокарте, свои Program/Preview, автосборка и автотесты. *(идёт)*
-2. **Переключатель и входы** — CUT / Fade / Merge по такту, Клип, камера, картинка, звонок, интерфейс плиток.
-3. **Звук** — шины, PFL, фейдеры на плитках, автотест синхрона.
-4. **Выходы** — мультистрим, рекордер, экраны и LED, наложения.
-5. **Триггеры, OSC, аналитика, MyOBS Encoder, установщик.**
-
-Каждый этап закрывается автотестами: в каждый кадр тестового сигнала зашит его номер, и программа
-проверяет каждый кадр эфирного выхода — вспышки, порядок, паузы.
-
-## Сборка
-
-Собирается автоматически на GitHub (вкладка **Actions**): движок OBS собирается один раз и кэшируется,
-затем программа и автотесты. Готовая папка программы — артефакт `myobs-windows` у сборки.
-
-Локально на Windows (Visual Studio 2026, CMake 3.28+):
-
-```
-pwsh ci/build-engine.ps1
-pwsh ci/build-app.ps1
-pwsh ci/run-tests.ps1
-```
-
-## Как делается
-
-Программа пишется с помощью **[Claude Code](https://claude.com/claude-code)** — ИИ-агента Anthropic
-для разработки, модель **Claude Opus 5.5**, уровень рассуждения «средний». Человек ставит задачи,
-проверяет этапы на живом оборудовании и принимает решения; код, тесты и автосборку пишет Claude.
-
-## English
+![Vertical 9:16 project](docs/concept/vertical.png)
 
 **MyOBS** is an open-source live production switcher for Windows in the spirit of vMix, built on the
 OBS engine (libobs) used as a library. The interface, switcher, clip playback, audio and triggers are
-its own. *Work in progress (stage 1 of 5); the images above are interface concepts, not screenshots.*
+its own.
 
 **Why.** OBS is great for a single streamer, but a multi-camera show with clips, calls and LED screens
 runs into its design. We measured it: on every take of a regular video clip OBS puts a blank frame on
@@ -123,8 +42,39 @@ frame of the program output is checked for flashes, order and pauses.
 reasoning effort. A human sets the goals, tests each stage on real broadcast hardware and makes the
 decisions; Claude writes the code, the tests and the CI.
 
-## Лицензия
+## Interface concept
 
-GPL-2.0-or-later. Движок — [OBS Studio](https://github.com/obsproject/obs-studio) (libobs),
-спасибо его авторам. Проект не связан с OBS Project и не одобрен им.
-*Not affiliated with or endorsed by the OBS Project.*
+| | |
+|---|---|
+| ![Tile](docs/concept/tile.png) | ![Composition and Merge](docs/concept/compose.png) |
+| Input tile | Compositions and the Merge transition |
+| ![Triggers](docs/concept/triggers.png) | ![Streams](docs/concept/streams.png) |
+| Triggers | Multistreaming |
+
+![Input settings](docs/concept/input.png)
+
+## Roadmap
+
+1. **Core** — engine on the discrete GPU, own Program/Preview, CI and automatic tests. *(in progress)*
+2. **Switcher and inputs** — frame-accurate CUT / Fade / Merge, Clip, camera, image, calls, tile UI.
+3. **Audio** — buses, PFL, tile faders, automatic A/V sync test.
+4. **Outputs** — multistreaming, recorder, screens and LED walls, overlays.
+5. **Triggers, OSC, analytics, MyOBS Encoder, installer.**
+
+## Building
+
+Built automatically on GitHub (**Actions** tab): the OBS engine is built once and cached, then the
+program and the automatic tests. The ready program folder is the `myobs-windows` artifact of each run.
+
+Locally on Windows (Visual Studio 2026, CMake 3.28+):
+
+```
+pwsh ci/build-engine.ps1
+pwsh ci/build-app.ps1
+pwsh ci/run-tests.ps1
+```
+
+## License
+
+GPL-2.0-or-later. Engine: [OBS Studio](https://github.com/obsproject/obs-studio) (libobs) — thanks to
+its authors. Not affiliated with or endorsed by the OBS Project.
