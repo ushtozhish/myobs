@@ -21,10 +21,15 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+#include <random>
+
+#include "switcher.hpp"
 
 namespace {
 
@@ -86,6 +91,7 @@ constexpr uint32_t kW = 640, kH = 360;
 
 struct Pattern {
 	obs_source_t *source;
+	uint32_t id = 0; /* input number, bits 12-15 of the code */
 	uint32_t counter = 0;
 	std::vector<uint8_t> y, u, v;
 };
@@ -94,7 +100,7 @@ void PatternTick(void *data, float)
 {
 	auto *p = static_cast<Pattern *>(data);
 	const int strip = kH / 9, bw = kW / 16;
-	const uint32_t code = p->counter & 0xFFFF;
+	const uint32_t code = ((p->id & 0xF) << 12) | (p->counter & 0xFFF);
 	for (int yy = 0; yy < strip; yy++)
 		for (int x = 0; x < (int)kW; x++)
 			p->y[(size_t)yy * kW + x] = ((code >> std::min(15, x / bw)) & 1) ? 235 : 16;
@@ -123,8 +129,9 @@ void RegisterPattern()
 	info.type = OBS_SOURCE_TYPE_INPUT;
 	info.output_flags = OBS_SOURCE_ASYNC_VIDEO;
 	info.get_name = [](void *) { return "Test pattern"; };
-	info.create = [](obs_data_t *, obs_source_t *source) -> void * {
+	info.create = [](obs_data_t *settings, obs_source_t *source) -> void * {
 		auto *p = new Pattern{source};
+		p->id = (uint32_t)obs_data_get_int(settings, "id");
 		p->y.assign((size_t)kW * kH, 128);
 		p->u.assign((size_t)kW * kH / 4, 128);
 		p->v.assign((size_t)kW * kH / 4, 128);
@@ -239,6 +246,158 @@ void TestPipeline()
 	Check(repeats + gaps <= (int)(codes.size() / 20), "frame order steady (repeats+gaps within 5%)");
 }
 
+/* ---- switcher: CUT / Fade on the program output, checked frame by frame ---- */
+
+struct Recorded {
+	std::mutex m;
+	std::vector<int> onAir; /* program input after each executed on-air change (CUT or fade end), in order */
+	int executed = 0;
+};
+
+obs_source_t *MakeInput(int id)
+{
+	obs_data_t *s = obs_data_create();
+	obs_data_set_int(s, "id", id);
+	obs_source_t *src = obs_source_create_private("myobs_test_pattern", ("input " + std::to_string(id)).c_str(), s);
+	obs_data_release(s);
+	return src;
+}
+
+/* Reads the program output while `drive` clicks, then checks: every clean frame shows an input that was
+ * on air, inputs appear in exactly the order they went on air (no return of the old picture = no
+ * "microplan"), no empty frames, and blended frames only while fades run. */
+void RunSwitchScenario(const char *title, bool fades, const std::function<void(myobs::Switcher &, std::mt19937 &)> &drive,
+		       int expectedRequests)
+{
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		g_codes.clear();
+	}
+	g_unreadable = 0;
+	const uint32_t laggedBefore = obs_get_lagged_frames();
+
+	obs_source_t *in[3] = {MakeInput(1), MakeInput(2), MakeInput(3)};
+	auto sw = std::make_unique<myobs::Switcher>();
+	Recorded rec;
+	sw->SetEventCallback([&rec](const myobs::Switcher::Event &e) {
+		std::lock_guard<std::mutex> lock(rec.m);
+		using K = myobs::Switcher::Event::Kind;
+		if (e.kind == K::Cut || e.kind == K::FadeStart)
+			rec.executed++;
+		if (e.kind == K::Cut || e.kind == K::FadeEnd)
+			rec.onAir.push_back(e.program + 1);
+	});
+	for (int i = 0; i < 3; i++)
+		sw->AddInput(in[i], "Input " + std::to_string(i + 1));
+	std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+	video_scale_info conv = {};
+	conv.format = VIDEO_FORMAT_I420;
+	conv.width = kW;
+	conv.height = kH;
+	conv.range = VIDEO_RANGE_PARTIAL;
+	conv.colorspace = VIDEO_CS_709;
+	obs_add_raw_video_callback(&conv, OnFrame, nullptr);
+	std::mt19937 rng(12345);
+	drive(*sw, rng);
+	/* let the queue drain and the last change reach the output */
+	for (int i = 0; i < 300 && (sw->PendingRequests() || sw->Transitioning()); i++)
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	std::this_thread::sleep_for(std::chrono::milliseconds(400));
+	obs_remove_raw_video_callback(OnFrame, nullptr);
+	sw.reset();
+	for (obs_source_t *s : in)
+		obs_source_release(s);
+
+	std::vector<int> codes;
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		codes = g_codes;
+	}
+	std::vector<int> expected;
+	int executed;
+	{
+		std::lock_guard<std::mutex> lock(rec.m);
+		for (int id : rec.onAir)
+			if (expected.empty() || expected.back() != id)
+				expected.push_back(id);
+		executed = rec.executed;
+	}
+	/* deduplicated input sequence seen on the output */
+	std::vector<int> seen;
+	int empty = 0;
+	for (int c : codes) {
+		const int id = c >> 12;
+		if (id < 1 || id > 3) {
+			empty++;
+			continue;
+		}
+		if (seen.empty() || seen.back() != id)
+			seen.push_back(id);
+	}
+	/* seen must follow expected in order; segments may be missing only if the engine dropped frames */
+	size_t j = 0;
+	int foreign = 0, missing = 0;
+	for (int id : seen) {
+		size_t k = j;
+		while (k < expected.size() && expected[k] != id)
+			k++;
+		if (k == expected.size()) {
+			foreign++; /* an input appears that is not next on air: old picture came back */
+			continue;
+		}
+		missing += (int)(k - j);
+		j = k + 1;
+	}
+	const uint32_t lagged = obs_get_lagged_frames() - laggedBefore;
+	std::printf("  [%s] frames %zu, on-air changes %zu, seen %zu, foreign %d, missing %d, empty %d, blended %d, "
+		    "lagged %u, requests executed %d/%d\n",
+		    title, codes.size(), expected.size(), seen.size(), foreign, missing, empty, g_unreadable.load(),
+		    lagged, executed, expectedRequests);
+	const std::string t = std::string(title) + ": ";
+	Check(codes.size() >= 30, t + "output delivers frames");
+	Check(foreign == 0, t + "no old or foreign picture after a switch (no microplan)");
+	Check(empty == 0, t + "no empty frames");
+	Check(fades || g_unreadable.load() == 0, t + "CUT gives clean frames (no blends)");
+	Check(missing <= (int)lagged, t + "every switch reaches the output (missing only on dropped frames)");
+	Check(executed == expectedRequests, t + "every click executed exactly once (none lost)");
+}
+
+void TestSwitcher()
+{
+	if (!obs_source_get_display_name("fade_transition")) {
+		Check(false, "fade transition available (obs-transitions plugin)");
+		return;
+	}
+	/* 1. Steady CUTs: one every 4-8 frames. */
+	RunSwitchScenario("cut steady", false, [](myobs::Switcher &sw, std::mt19937 &rng) {
+		for (int i = 0; i < 40; i++) {
+			sw.SetPreview((int)(rng() % 3));
+			sw.Cut();
+			std::this_thread::sleep_for(std::chrono::milliseconds(130 + rng() % 140));
+		}
+	}, 41 /* + the first input taken to program at start */);
+	/* 2. Chaos: bursts of clicks faster than frames. */
+	RunSwitchScenario("cut chaos", false, [](myobs::Switcher &sw, std::mt19937 &rng) {
+		for (int i = 0; i < 80; i++) {
+			sw.SetPreview((int)(rng() % 3));
+			sw.Cut();
+			std::this_thread::sleep_for(std::chrono::milliseconds(rng() % 40));
+		}
+	}, 81);
+	/* 3. Fades with clicks during the fade: they wait for the fade end. */
+	RunSwitchScenario("fade + clicks", true, [](myobs::Switcher &sw, std::mt19937 &rng) {
+		for (int i = 0; i < 12; i++) {
+			sw.SetPreview((int)(rng() % 3));
+			sw.Fade(300);
+			std::this_thread::sleep_for(std::chrono::milliseconds(60 + rng() % 120));
+			if (i % 3 == 0)
+				sw.Cut(); /* during the fade */
+			std::this_thread::sleep_for(std::chrono::milliseconds(150 + rng() % 300));
+		}
+	}, 17);
+}
+
 void TestPlugins()
 {
 	LoadPluginsNextToExe();
@@ -256,6 +415,7 @@ int main()
 	if (StartEngine()) {
 		TestPipeline();
 		TestPlugins();
+		TestSwitcher();
 	} else {
 		Check(false, "engine start");
 	}
