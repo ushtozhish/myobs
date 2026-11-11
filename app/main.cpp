@@ -1,8 +1,8 @@
 /* MyOBS — live production program on the OBS engine (libobs).
  *
- * Stage 1 skeleton: starts the engine on the discrete GPU, loads the engine plugins and our
- * own ones («Клип»), shows the Preview and Program monitors at the project format and the
- * load line. The switcher, inputs and the rest of the interface are built on this next.
+ * Stage 1: engine on the discrete GPU, engine plugins and our own ones («Клип»), Preview and
+ * Program monitors at the project format, the switcher (CUT / FADE on a frame boundary) and
+ * the input tiles, the load line.
  *
  * The log is written to %LOCALAPPDATA%/MyOBS/logs (one file per start).
  */
@@ -12,6 +12,8 @@
 #include <util/platform.h>
 
 #include "plugins.hpp"
+#include "switcher.hpp"
+#include "inputs.hpp"
 
 #include <QApplication>
 #include <QDateTime>
@@ -75,6 +77,20 @@ QWidget#MyOBS { background: #15171a; color: #d8dade; font-size: 12px; }
 QLabel#monitorTitle { color: #c9ccd1; font-size: 12px; padding: 1px 0; }
 QLabel#load { color: #8a8f97; font-family: Consolas, monospace; font-size: 11px; }
 QLabel#loadBad { color: #ff6b5a; font-family: Consolas, monospace; font-size: 11px; }
+QPushButton { background: #22252a; color: #d8dade; border: 1px solid #33373e; padding: 5px 12px; }
+QPushButton:hover { background: #2a2e34; }
+QPushButton:pressed { background: #33373e; }
+QPushButton#cut { background: #5a1714; border-color: #e0312b; font-weight: bold; min-width: 70px; }
+QPushButton#fade { background: #4a2c0c; border-color: #f28c1e; font-weight: bold; min-width: 70px; }
+QSpinBox { background: #1b1d21; color: #d8dade; border: 1px solid #33373e; padding: 3px; }
+QLabel#switchStatus { color: #f28c1e; }
+QWidget#tilesHost { background: #15171a; }
+QScrollArea { background: #15171a; }
+QFrame#tile { background: #1d2024; border: 2px solid #2c3036; }
+QFrame#tile[state="preview"] { border-color: #f28c1e; background: #2a2116; }
+QFrame#tile[state="program"] { border-color: #e0312b; background: #2c1715; }
+QLabel#tileNumber { color: #8a8f97; font-size: 11px; }
+QLabel#tileName { color: #e4e6ea; font-size: 13px; }
 )";
 
 /* ---- main window (skeleton) ---- */
@@ -102,7 +118,10 @@ public:
 		previewTitle_->setText("PREVIEW");
 		programTitle_->setText("PROGRAM");
 		root->addLayout(top, 5);
-		root->addStretch(4);
+
+		switcher_ = std::make_unique<myobs::Switcher>();
+		inputs_ = new InputsPanel(switcher_.get(), this);
+		root->addWidget(inputs_, 4);
 
 		load_ = new QLabel(this);
 		load_->setObjectName("load");
@@ -111,15 +130,37 @@ public:
 		auto *timer = new QTimer(this);
 		connect(timer, &QTimer::timeout, this, [this]() { Tick(); });
 		timer->start(500);
+
+		/* Switch state on screen: tile colours, monitor titles, preview picture. */
+		auto *fast = new QTimer(this);
+		connect(fast, &QTimer::timeout, this, [this]() { RefreshSwitch(); });
+		fast->start(40);
 	}
 
 	~MainWindow() override
 	{
 		preview_->DestroyDisplay();
 		program_->DestroyDisplay();
+		delete inputs_;
+		switcher_.reset();
 	}
 
 private:
+	void RefreshSwitch()
+	{
+		inputs_->Refresh();
+		const int pv = switcher_->Preview(), pg = switcher_->Program();
+		if (pv != shownPreview_ || switcher_->InputCount() != shownCount_) {
+			shownPreview_ = pv;
+			shownCount_ = switcher_->InputCount();
+			preview_->SetSource(switcher_->InputScene(pv));
+		}
+		const QString pvName = QString::fromStdString(switcher_->InputName(pv));
+		const QString pgName = QString::fromStdString(switcher_->InputName(pg));
+		previewTitle_->setText(pvName.isEmpty() ? "PREVIEW" : "PREVIEW  ·  " + pvName);
+		programTitle_->setText(pgName.isEmpty() ? "PROGRAM" : "PROGRAM  ·  " + pgName);
+	}
+
 	QWidget *Monitor(QLabel *&label, SourceDisplay *display, const char *color)
 	{
 		label = new QLabel(this);
@@ -170,6 +211,10 @@ private:
 	}
 
 	QString gpu_;
+	std::unique_ptr<myobs::Switcher> switcher_;
+	InputsPanel *inputs_ = nullptr;
+	int shownPreview_ = -2;
+	int shownCount_ = -1;
 	SourceDisplay *preview_ = nullptr;
 	SourceDisplay *program_ = nullptr;
 	QLabel *previewTitle_ = nullptr;

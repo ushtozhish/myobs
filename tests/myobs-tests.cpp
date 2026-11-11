@@ -332,6 +332,25 @@ void RunSwitchScenario(const char *title, bool fades, const std::function<void(m
 	Check(executed == expectedRequests, t + "every click executed exactly once (none lost)");
 }
 
+void TestRemoveInput()
+{
+	obs_source_t *in[3] = {MakeInput(1), MakeInput(2), MakeInput(3)};
+	{
+		myobs::Switcher sw;
+		for (int i = 0; i < 3; i++)
+			sw.AddInput(in[i], "Input " + std::to_string(i + 1));
+		sw.SetPreview(2);
+		for (int i = 0; i < 100 && (sw.Program() != 0 || sw.Preview() != 2); i++)
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		Check(!sw.RemoveInput(0), "remove input: the input on air cannot be removed");
+		Check(sw.RemoveInput(1), "remove input: an input off air is removed");
+		Check(sw.InputCount() == 2 && sw.Program() == 0 && sw.Preview() == 1 && sw.InputName(1) == "Input 3",
+		      "remove input: program and preview keep pointing at the same inputs");
+	}
+	for (obs_source_t *s : in)
+		obs_source_release(s);
+}
+
 void TestSwitcher()
 {
 	if (!obs_source_get_display_name("fade_transition")) {
@@ -384,6 +403,7 @@ int main()
 		TestPipeline();
 		TestPlugins();
 		TestSwitcher();
+		TestRemoveInput();
 	} else {
 		Check(false, "engine start");
 	}

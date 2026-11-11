@@ -34,6 +34,8 @@ public:
 
 	// Wraps the source into a scene named like the input. Returns the input index.
 	int AddInput(obs_source_t *source, const std::string &name);
+	// Removes an input that is not on air and not in a running fade. Returns false if refused.
+	bool RemoveInput(int index);
 	int InputCount() const;
 	std::string InputName(int index) const;
 	obs_source_t *InputScene(int index) const; // not referenced; valid while the switcher lives

@@ -59,6 +59,32 @@ int Switcher::AddInput(obs_source_t *source, const std::string &name)
 	return index;
 }
 
+bool Switcher::RemoveInput(int index)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (index < 0 || index >= (int)scenes_.size() || index == program_ || index == fadeTarget_)
+		return false;
+	obs_scene_t *scene = scenes_[index];
+	scenes_.erase(scenes_.begin() + index);
+	names_.erase(names_.begin() + index);
+	auto shift = [index](int i) { return i > index ? i - 1 : i; };
+	program_ = shift(program_);
+	preview_ = preview_ == index ? program_.load() : shift(preview_);
+	fadeTarget_ = shift(fadeTarget_);
+	for (auto it = queue_.begin(); it != queue_.end();) {
+		if (it->kind == Request::Kind::Preview && it->index == index) {
+			it = queue_.erase(it);
+			continue;
+		}
+		if (it->kind == Request::Kind::Preview)
+			it->index = shift(it->index);
+		++it;
+	}
+	obs_source_dec_showing(obs_scene_get_source(scene));
+	obs_scene_release(scene);
+	return true;
+}
+
 int Switcher::InputCount() const
 {
 	std::lock_guard<std::mutex> lock(mutex_);
