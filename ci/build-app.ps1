@@ -7,7 +7,7 @@ $deps = Get-ChildItem (Join-Path $root 'engine-build/deps') -Directory
 $prefix = @($engine) + ($deps | ForEach-Object { $_.FullName })
 $prefixArg = ($prefix -join ';').Replace('\', '/')
 
-cmake -S $root -B (Join-Path $root 'build') -G 'Visual Studio 17 2022' -A x64 "-DCMAKE_PREFIX_PATH=$prefixArg"
+cmake -S $root -B (Join-Path $root 'build') -G 'Visual Studio 18 2026' -A x64 "-DCMAKE_PREFIX_PATH=$prefixArg"
 if ($LASTEXITCODE) { throw 'configure failed' }
 cmake --build (Join-Path $root 'build') --config RelWithDebInfo --parallel
 if ($LASTEXITCODE) { throw 'build failed' }
