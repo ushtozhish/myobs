@@ -23,5 +23,12 @@ set(MYOBS_PLUGIN_DIR obs-plugins/64bit)
 add_subdirectory(core)
 add_subdirectory(plugins/myobs-clip)
 add_subdirectory(plugins/myobs-ndi)
+
+# Calls (VDO.Ninja, GPL-3.0): built when the patched libdatachannel and Mbed TLS are prepared.
+if(MYOBS_LIBDATACHANNEL_DIR AND MYOBS_MBEDTLS_DIR)
+  add_subdirectory(third_party/obs-vdoninja)
+else()
+  message(WARNING "MYOBS_LIBDATACHANNEL_DIR / MYOBS_MBEDTLS_DIR not set - calls (obs-vdoninja) are not built")
+endif()
 add_subdirectory(app)
 add_subdirectory(tests)

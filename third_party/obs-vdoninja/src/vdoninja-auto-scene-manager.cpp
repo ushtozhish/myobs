@@ -1,0 +1,500 @@
+/*
+ * OBS VDO.Ninja Plugin
+ * OBS scene/source automation for inbound VDO.Ninja streams
+ */
+
+#include "vdoninja-auto-scene-manager.h"
+
+#include <obs-frontend-api.h>
+
+#include <cctype>
+#include <chrono>
+
+#include "vdoninja-auto-inbound-state.h"
+#include "vdoninja-layout.h"
+#include "vdoninja-utils.h"
+
+namespace vdoninja
+{
+
+namespace
+{
+
+void runUiTaskThunk(void *param)
+{
+	auto *fn = static_cast<std::function<void()> *>(param);
+	(*fn)();
+	delete fn;
+}
+
+obs_source_t *acquireTargetSceneSource(const std::string &targetScene)
+{
+	obs_source_t *sceneSource = nullptr;
+	if (!targetScene.empty()) {
+		sceneSource = obs_get_source_by_name(targetScene.c_str());
+	}
+
+	if (!sceneSource) {
+		sceneSource = obs_frontend_get_current_scene();
+	}
+
+	return sceneSource;
+}
+
+// Runs on the UI thread with value-captured state only; the manager itself may
+// already be destroyed by the time this executes.
+void applyGridLayoutOnUi(const std::string &targetScene, const std::vector<std::string> &sourceNames, int fallbackWidth,
+                         int fallbackHeight)
+{
+	obs_source_t *sceneSource = acquireTargetSceneSource(targetScene);
+	if (!sceneSource) {
+		return;
+	}
+
+	obs_scene_t *scene = obs_scene_from_source(sceneSource);
+	if (!scene) {
+		obs_source_release(sceneSource);
+		return;
+	}
+
+	obs_video_info ovi = {};
+	const bool gotVideoInfo = obs_get_video_info(&ovi);
+	const uint32_t canvasWidth = gotVideoInfo ? ovi.base_width : static_cast<uint32_t>(fallbackWidth);
+	const uint32_t canvasHeight = gotVideoInfo ? ovi.base_height : static_cast<uint32_t>(fallbackHeight);
+
+	std::vector<obs_sceneitem_t *> items;
+	for (const auto &sourceName : sourceNames) {
+		obs_sceneitem_t *item = obs_scene_find_source(scene, sourceName.c_str());
+		if (item) {
+			items.push_back(item);
+		}
+	}
+
+	auto layout = buildGridLayout(items.size(), canvasWidth, canvasHeight);
+	for (size_t i = 0; i < items.size() && i < layout.size(); ++i) {
+		obs_sceneitem_t *item = items[i];
+		obs_source_t *itemSource = obs_sceneitem_get_source(item);
+		if (!itemSource) {
+			continue;
+		}
+
+		uint32_t sourceWidth = obs_source_get_width(itemSource);
+		uint32_t sourceHeight = obs_source_get_height(itemSource);
+		if (sourceWidth == 0) {
+			sourceWidth = static_cast<uint32_t>(layout[i].width);
+		}
+		if (sourceHeight == 0) {
+			sourceHeight = static_cast<uint32_t>(layout[i].height);
+		}
+
+		struct vec2 pos = {layout[i].x, layout[i].y};
+		struct vec2 scale = {layout[i].width / static_cast<float>(sourceWidth),
+		                     layout[i].height / static_cast<float>(sourceHeight)};
+		obs_sceneitem_set_pos(item, &pos);
+		obs_sceneitem_set_scale(item, &scale);
+		obs_sceneitem_set_visible(item, true);
+	}
+
+	obs_source_release(sceneSource);
+}
+
+} // namespace
+
+VDOAutoSceneManager::~VDOAutoSceneManager()
+{
+	stop();
+}
+
+void VDOAutoSceneManager::configure(const AutoInboundSettings &settings)
+{
+	std::lock_guard<std::mutex> lock(stateMutex_);
+	settings_ = settings;
+}
+
+void VDOAutoSceneManager::setOwnStreamIds(const std::vector<std::string> &streamIds)
+{
+	std::lock_guard<std::mutex> lock(stateMutex_);
+	ownStreamIds_.clear();
+	for (const auto &streamId : streamIds) {
+		if (!streamId.empty()) {
+			ownStreamIds_.insert(streamId);
+		}
+	}
+}
+
+void VDOAutoSceneManager::start()
+{
+	std::lock_guard<std::mutex> lock(stateMutex_);
+	if (!settings_.enabled || running_) {
+		return;
+	}
+
+	running_ = true;
+	managedStreamIds_.clear();
+	pendingListingRemovals_.clear();
+	removalThread_ = std::thread(&VDOAutoSceneManager::removalWorkerLoop, this);
+}
+
+void VDOAutoSceneManager::stop()
+{
+	std::set<std::string> managedStreamsSnapshot;
+	bool removeOnDisconnect = false;
+	std::thread removalThread;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		if (!running_ && !removalThread_.joinable()) {
+			return;
+		}
+
+		running_ = false;
+		removeOnDisconnect = settings_.removeOnDisconnect;
+		managedStreamsSnapshot = managedStreamIds_;
+		managedStreamIds_.clear();
+		pendingListingRemovals_.clear();
+		removalThread = std::move(removalThread_);
+	}
+	removalCv_.notify_all();
+	if (removalThread.joinable()) {
+		removalThread.join();
+	}
+
+	if (!removeOnDisconnect) {
+		return;
+	}
+
+	const auto sceneAssignments = sceneAssignments_;
+	for (const auto &streamId : managedStreamsSnapshot) {
+		const std::string sourceName = sourceNameForStream(streamId);
+		runOnUiThread([sourceName, sceneAssignments]() {
+			sceneAssignments->take(sourceName);
+			obs_source_t *source = obs_get_source_by_name(sourceName.c_str());
+			if (!source) {
+				return;
+			}
+			obs_source_remove(source);
+			obs_source_release(source);
+		});
+	}
+}
+
+void VDOAutoSceneManager::onRoomListing(const std::vector<std::string> &streamIds)
+{
+	AutoInboundListingDelta delta;
+	bool graceStateChanged = false;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		if (!running_) {
+			return;
+		}
+		delta = reconcileAutoInboundListing(managedStreamIds_, ownStreamIds_, streamIds);
+		for (const auto &streamId : streamIds) {
+			if (!streamId.empty() && ownStreamIds_.find(streamId) == ownStreamIds_.end()) {
+				pendingListingRemovals_.cancel(streamId);
+				graceStateChanged = true;
+			}
+		}
+		const int64_t now = currentTimeMs();
+		for (const auto &streamId : delta.removed) {
+			pendingListingRemovals_.schedule(streamId, now);
+			graceStateChanged = true;
+		}
+	}
+
+	if (graceStateChanged) {
+		removalCv_.notify_all();
+	}
+	for (const auto &streamId : delta.added) {
+		onStreamAdded(streamId);
+	}
+}
+
+void VDOAutoSceneManager::onStreamAdded(const std::string &streamId)
+{
+	if (streamId.empty()) {
+		return;
+	}
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		if (!running_ || ownStreamIds_.find(streamId) != ownStreamIds_.end()) {
+			return;
+		}
+		pendingListingRemovals_.cancel(streamId);
+	}
+	removalCv_.notify_all();
+
+	const std::string sourceUrl = buildSourceUrl(streamId);
+	if (sourceUrl.empty()) {
+		logWarning("Ignoring auto-inbound target without a usable VDO.Ninja viewer URL: %s", streamId.c_str());
+		return;
+	}
+
+	bool switchScene = false;
+	int sourceWidth = 1920;
+	int sourceHeight = 1080;
+	AutoLayoutMode layoutMode = AutoLayoutMode::Grid;
+	std::string targetScene;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		if (!running_) {
+			return;
+		}
+		if (ownStreamIds_.find(streamId) != ownStreamIds_.end()) {
+			return;
+		}
+		pendingListingRemovals_.cancel(streamId);
+		if (!managedStreamIds_.insert(streamId).second) {
+			return;
+		}
+		switchScene = settings_.switchToSceneOnNewStream;
+		sourceWidth = settings_.width;
+		sourceHeight = settings_.height;
+		layoutMode = settings_.layoutMode;
+		targetScene = settings_.targetScene;
+	}
+
+	const std::string sourceName = sourceNameForStream(streamId);
+	const auto sceneAssignments = sceneAssignments_;
+
+	runOnUiThread([sourceName, sourceUrl, switchScene, sourceWidth, sourceHeight, targetScene, sceneAssignments]() {
+		obs_source_t *sceneSource = acquireTargetSceneSource(targetScene);
+		obs_scene_t *scene = sceneSource ? obs_scene_from_source(sceneSource) : nullptr;
+
+		obs_data_t *settings = obs_data_create();
+		obs_data_set_string(settings, "url", sourceUrl.c_str());
+		obs_data_set_int(settings, "width", sourceWidth);
+		obs_data_set_int(settings, "height", sourceHeight);
+		obs_data_set_int(settings, "fps", 30);
+		obs_data_set_bool(settings, "reroute_audio", true);
+		obs_data_set_bool(settings, "restart_when_active", false);
+		obs_data_set_bool(settings, "shutdown", false);
+
+		obs_source_t *source = obs_get_source_by_name(sourceName.c_str());
+		if (source) {
+			obs_source_update(source, settings);
+		} else {
+			source = obs_source_create("browser_source", sourceName.c_str(), settings, nullptr);
+		}
+
+		if (source && scene) {
+			obs_sceneitem_t *item = obs_scene_find_source(scene, sourceName.c_str());
+			if (!item) {
+				item = obs_scene_add(scene, source);
+			}
+			if (item) {
+				obs_sceneitem_set_visible(item, true);
+				const char *sceneUuid = obs_source_get_uuid(sceneSource);
+				if (sceneUuid && *sceneUuid) {
+					sceneAssignments->remember(sourceName, sceneUuid);
+				}
+			}
+		}
+
+		if (switchScene && sceneSource) {
+			obs_frontend_set_current_scene(sceneSource);
+		}
+
+		if (source) {
+			obs_source_release(source);
+		}
+		obs_data_release(settings);
+		if (sceneSource) {
+			obs_source_release(sceneSource);
+		}
+	});
+
+	if (layoutMode == AutoLayoutMode::Grid) {
+		queueLayoutRefresh();
+	}
+}
+
+void VDOAutoSceneManager::onStreamRemoved(const std::string &streamId)
+{
+	bool refreshLayout = false;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		if (streamId.empty()) {
+			return;
+		}
+		pendingListingRemovals_.cancel(streamId);
+		refreshLayout = queueStreamRemovalLocked(streamId);
+	}
+	removalCv_.notify_all();
+
+	if (refreshLayout) {
+		queueLayoutRefresh();
+	}
+}
+
+void VDOAutoSceneManager::removalWorkerLoop()
+{
+	for (;;) {
+		std::unique_lock<std::mutex> lock(stateMutex_);
+		if (!running_) {
+			return;
+		}
+
+		const int64_t nextDeadline = pendingListingRemovals_.nextDeadlineMs();
+		if (nextDeadline == 0) {
+			removalCv_.wait(lock);
+			continue;
+		}
+
+		const int64_t now = currentTimeMs();
+		if (nextDeadline > now) {
+			removalCv_.wait_for(lock, std::chrono::milliseconds(nextDeadline - now));
+			continue;
+		}
+
+		bool refreshLayout = false;
+		const auto dueStreamIds = pendingListingRemovals_.takeDue(now);
+		for (const auto &streamId : dueStreamIds) {
+			if (managedStreamIds_.find(streamId) != managedStreamIds_.end()) {
+				refreshLayout = queueStreamRemovalLocked(streamId) || refreshLayout;
+			}
+		}
+
+		lock.unlock();
+		if (refreshLayout) {
+			queueLayoutRefresh();
+		}
+	}
+}
+
+bool VDOAutoSceneManager::queueStreamRemovalLocked(const std::string &streamId)
+{
+	managedStreamIds_.erase(streamId);
+	const bool removeSource = settings_.removeOnDisconnect;
+	const std::string targetScene = settings_.targetScene;
+	const std::string sourceName = makeSourceName(settings_.sourcePrefix, streamId);
+	const bool refreshLayout = settings_.layoutMode == AutoLayoutMode::Grid;
+	const auto sceneAssignments = sceneAssignments_;
+
+	// Queue while holding stateMutex_ so a concurrent re-add is ordered after
+	// this removal on the OBS UI queue.
+	runOnUiThread([sourceName, removeSource, targetScene, sceneAssignments]() {
+		obs_source_t *source = obs_get_source_by_name(sourceName.c_str());
+		const std::string assignedSceneUuid = sceneAssignments->take(sourceName);
+		obs_source_t *sceneSource = assignedSceneUuid.empty() ? acquireTargetSceneSource(targetScene)
+		                                                      : obs_get_source_by_uuid(assignedSceneUuid.c_str());
+		obs_scene_t *scene = sceneSource ? obs_scene_from_source(sceneSource) : nullptr;
+
+		if (source && removeSource) {
+			obs_source_remove(source);
+		} else if (scene) {
+			obs_sceneitem_t *item = obs_scene_find_source(scene, sourceName.c_str());
+			if (item) {
+				obs_sceneitem_set_visible(item, false);
+			}
+		}
+
+		if (source) {
+			obs_source_release(source);
+		}
+		if (sceneSource) {
+			obs_source_release(sceneSource);
+		}
+	});
+
+	return refreshLayout;
+}
+
+void VDOAutoSceneManager::queueLayoutRefresh() const
+{
+	std::vector<std::string> sourceNames;
+	int fallbackWidth = 1920;
+	int fallbackHeight = 1080;
+	std::string targetScene;
+	std::string prefix;
+	std::set<std::string> managedStreamIds;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		fallbackWidth = settings_.width;
+		fallbackHeight = settings_.height;
+		targetScene = settings_.targetScene;
+		prefix = settings_.sourcePrefix;
+		managedStreamIds = managedStreamIds_;
+	}
+
+	sourceNames.reserve(managedStreamIds.size());
+	for (const auto &streamId : managedStreamIds) {
+		sourceNames.push_back(makeSourceName(prefix, streamId));
+	}
+
+	runOnUiThread([targetScene, sourceNames, fallbackWidth, fallbackHeight]() {
+		applyGridLayoutOnUi(targetScene, sourceNames, fallbackWidth, fallbackHeight);
+	});
+}
+
+void VDOAutoSceneManager::runOnUiThread(const std::function<void()> &fn) const
+{
+	// Fire-and-forget. These calls originate from signaling/RTC callback
+	// threads; waiting for the UI thread here deadlocks against output stop()
+	// and teardown, which run on the UI thread while waiting for those same
+	// callbacks to return. All queued lambdas capture state by value so they
+	// stay valid even if this manager is destroyed first.
+	auto *heapFn = new std::function<void()>(fn);
+	obs_queue_task(OBS_TASK_UI, runUiTaskThunk, heapFn, false);
+}
+
+bool VDOAutoSceneManager::isOwnStream(const std::string &streamId) const
+{
+	std::lock_guard<std::mutex> lock(stateMutex_);
+	return ownStreamIds_.find(streamId) != ownStreamIds_.end();
+}
+
+std::string VDOAutoSceneManager::makeSourceName(std::string prefix, const std::string &streamId)
+{
+	if (prefix.empty()) {
+		prefix = "VDO";
+	}
+	return prefix + "_Cam_" + sanitizeNameToken(streamId);
+}
+
+std::string VDOAutoSceneManager::sourceNameForStream(const std::string &streamId) const
+{
+	std::string prefix;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		prefix = settings_.sourcePrefix;
+	}
+	return makeSourceName(prefix, streamId);
+}
+
+std::string VDOAutoSceneManager::buildSourceUrl(const std::string &streamId) const
+{
+	std::string baseUrl;
+	std::string password;
+	std::string roomId;
+	std::string salt;
+	std::string wssHost;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		baseUrl = settings_.baseUrl;
+		password = settings_.password;
+		roomId = settings_.roomId;
+		salt = settings_.salt;
+		wssHost = settings_.wssHost;
+	}
+	if (baseUrl.empty()) {
+		baseUrl = "https://vdo.ninja";
+	}
+
+	return buildInboundViewUrl(baseUrl, streamId, password, roomId, salt, wssHost);
+}
+
+std::string VDOAutoSceneManager::sanitizeNameToken(const std::string &input)
+{
+	std::string output;
+	output.reserve(input.size());
+	for (char c : input) {
+		const unsigned char uc = static_cast<unsigned char>(c);
+		if (std::isalnum(uc) || c == '_' || c == '-') {
+			output.push_back(c);
+		} else {
+			output.push_back('_');
+		}
+	}
+	return output;
+}
+
+} // namespace vdoninja

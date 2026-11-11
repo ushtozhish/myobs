@@ -1,0 +1,379 @@
+/*
+ * OBS VDO.Ninja Plugin
+ * Copyright (C) 2024 VDO.Ninja Community
+ *
+ * Common definitions and types shared across the plugin
+ */
+
+#pragma once
+
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "vdoninja-loss-protection.h"
+#include "vdoninja-network-settings.h"
+#include "vdoninja-video-keyframe-gate.h"
+
+// Forward declarations for libdatachannel
+namespace rtc
+{
+class PeerConnection;
+class DataChannel;
+class Track;
+class RtcpSrReporter;
+class RtpPacketizationConfig;
+struct Configuration;
+} // namespace rtc
+
+namespace vdoninja
+{
+
+class RtpPacketPacer;
+class RtcpFeedbackTracker;
+
+// VDO.Ninja default configuration
+constexpr const char *DEFAULT_WSS_HOST = "wss://wss.vdo.ninja";
+constexpr const char *DEFAULT_SALT = "vdo.ninja";
+constexpr const char *DEFAULT_PASSWORD = "someEncryptionKey123";
+constexpr int DEFAULT_RECONNECT_ATTEMPTS = 5;
+constexpr int MIN_RECONNECT_INTERVAL_MS = 15 * 60 * 1000;
+constexpr int ICE_CANDIDATE_BUNDLE_DELAY_MS = 70;
+
+// Default STUN servers
+const std::vector<std::string> DEFAULT_STUN_SERVERS = {"stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"};
+
+// Connection types
+enum class ConnectionType {
+	Publisher, // We are sending media to a viewer
+	Viewer     // We are receiving media from a publisher
+};
+
+// Connection state
+enum class ConnectionState { New, Connecting, Connected, Disconnected, Failed, Closed };
+
+// Stream quality settings
+struct StreamQuality {
+	int width = 1920;
+	int height = 1080;
+	int fps = 30;
+	int bitrate = 4000000; // 4 Mbps default
+};
+
+// ICE server configuration
+struct IceServer {
+	std::string urls;
+	std::string username;
+	std::string credential;
+};
+
+// Peer connection info
+struct PeerInfo {
+	std::string uuid;
+	std::string streamId;
+	std::string session;
+	uint64_t generation = 0;
+	std::atomic<uint64_t> nextEventSequence{0};
+	ConnectionType type;
+	bool whepPublisher = false;
+	std::atomic<ConnectionState> state{ConnectionState::New};
+	std::atomic<int64_t> terminalStateTimeMs{0};
+	std::atomic<bool> disconnectNotified{false};
+	std::atomic<bool> cleanupRetired{false};
+	std::atomic<bool> signalingActive{false};
+	bool signalingLifecycleTerminalClaimed = false; // Guarded by the peer-manager registry mutex.
+	std::atomic<bool> localOfferRequested{false};
+	std::atomic<bool> localOfferDispatched{false};
+	std::atomic<bool> remoteDescriptionSet{false};
+	mutable std::mutex negotiationMutex;
+	std::string lastLocalOfferSdp;
+	mutable std::mutex mediaMutex;
+	mutable std::recursive_mutex dataChannelLifecycleMutex;
+	mutable std::recursive_mutex dataChannelCallbackMutationMutex;
+	mutable std::mutex audioSendMutex;
+	mutable std::mutex videoSendMutex;
+	bool hasDataChannel = false;
+	uint64_t dataChannelRevision = 0;
+	bool dataChannelOpenDispatched = false;
+	bool dataChannelOpenDispatchPending = false;
+	std::vector<std::weak_ptr<rtc::DataChannel>> dataChannelsWithObservedOpen;
+	std::vector<std::shared_ptr<rtc::DataChannel>> retiredDataChannelsPendingCallbackCleanup;
+	VideoKeyframeGate videoKeyframeGate;
+	bool audioSendEnabled = true;
+	bool videoSendEnabled = true;
+	std::shared_ptr<rtc::PeerConnection> pc;
+	std::shared_ptr<rtc::DataChannel> dataChannel;
+	std::shared_ptr<rtc::DataChannel> signalingDataChannel;
+	std::string signalingDataChannelTransportUuid;
+	uint64_t signalingDataChannelTransportGeneration = 0;
+	uint64_t signalingDataChannelRevision = 0;
+	std::shared_ptr<rtc::Track> audioTrack;
+	std::shared_ptr<rtc::Track> videoTrack;
+	std::shared_ptr<rtc::Track> alphaVideoTrack;
+	uint64_t audioTrackRevision = 0;
+	uint64_t videoTrackRevision = 0;
+	uint64_t alphaVideoTrackRevision = 0;
+	std::shared_ptr<rtc::RtcpSrReporter> audioSrReporter;
+	std::shared_ptr<rtc::RtcpSrReporter> videoSrReporter;
+	std::shared_ptr<rtc::RtpPacketizationConfig> audioRtpConfig;
+	std::shared_ptr<rtc::RtpPacketizationConfig> videoRtpConfig;
+	std::shared_ptr<RtcpFeedbackTracker> videoFeedbackTracker;
+	std::shared_ptr<RtpPacketPacer> videoPacer;
+	uint8_t videoColorExtensionId = 0; // Protected by mediaMutex; zero means not negotiated.
+	bool useAudioPacketizer = false;
+	bool useVideoPacketizer = false;
+	bool useAudioRed = false;
+	bool hasPreviousOpusPayload = false;
+	std::vector<uint8_t> previousOpusPayload;
+	uint32_t previousOpusTimestamp = 0;
+	bool localDescriptionCallbackInstalled = false;
+	uint16_t audioSeq = 0;
+	uint16_t videoSeq = 0;
+	uint32_t audioTimestamp = 0;
+	uint32_t videoTimestamp = 0;
+};
+
+// Room information
+struct RoomInfo {
+	std::string roomId;
+	std::string hashedRoomId;
+	std::string password;
+	bool isJoined = false;
+	std::vector<std::string> members;
+};
+
+// Stream information
+struct StreamInfo {
+	std::string streamId;
+	std::string hashedStreamId;
+	std::string password;
+	bool isPublishing = false;
+	bool isViewing = false;
+};
+
+// Callbacks for signaling events
+using OnConnectedCallback = std::function<void()>;
+using OnDisconnectedCallback = std::function<void()>;
+using OnErrorCallback = std::function<void(const std::string &error)>;
+using OnOfferCallback =
+    std::function<void(const std::string &uuid, const std::string &sdp, const std::string &session)>;
+using OnAnswerCallback =
+    std::function<void(const std::string &uuid, const std::string &sdp, const std::string &session)>;
+using OnOfferRequestCallback = std::function<void(const std::string &uuid, const std::string &session)>;
+using OnIceRestartRequestCallback = std::function<void(const std::string &uuid, const std::string &session)>;
+using OnIceCandidateCallback = std::function<void(const std::string &uuid, const std::string &candidate,
+                                                  const std::string &mid, const std::string &session)>;
+using OnRoomJoinedCallback = std::function<void(const std::vector<std::string> &members)>;
+using OnStreamAddedCallback = std::function<void(const std::string &streamId, const std::string &uuid)>;
+using OnStreamRemovedCallback = std::function<void(const std::string &streamId, const std::string &uuid)>;
+using OnPeerCleanupCallback = std::function<void(const std::string &uuid, const std::string &session)>;
+using OnDataCallback = std::function<void(const std::string &uuid, const std::string &data)>;
+
+// Video codec preferences
+// Append values: existing numbers are persisted in OBS settings.
+enum class VideoCodec { H264, VP8, VP9, AV1, H265 };
+
+inline const char *videoCodecRtpName(VideoCodec codec)
+{
+	switch (codec) {
+	case VideoCodec::H265:
+		return "H265";
+	case VideoCodec::AV1:
+		return "AV1";
+	case VideoCodec::VP9:
+		return "VP9";
+	case VideoCodec::VP8:
+		return "VP8";
+	default:
+		return "H264";
+	}
+}
+
+inline std::optional<VideoCodec> publishingCodecForEncoder(const std::string &codec)
+{
+	if (codec == "h264")
+		return VideoCodec::H264;
+	if (codec == "hevc" || codec == "h265")
+		return VideoCodec::H265;
+	if (codec == "av1")
+		return VideoCodec::AV1;
+	return std::nullopt;
+}
+
+// Audio codec preferences
+enum class AudioCodec { Opus, PCMU, PCMA };
+
+// Auto layout mode for browser source orchestration.
+enum class AutoLayoutMode { None, Grid };
+
+// OBS scene automation settings for inbound streams.
+struct AutoInboundSettings {
+	bool enabled = false;
+	std::string roomId;
+	std::string password;
+	std::string salt = DEFAULT_SALT;
+	std::string targetScene;
+	std::string sourcePrefix = "VDO";
+	std::string baseUrl = "https://vdo.ninja";
+	std::string wssHost = DEFAULT_WSS_HOST;
+	bool removeOnDisconnect = true;
+	AutoLayoutMode layoutMode = AutoLayoutMode::Grid;
+	bool switchToSceneOnNewStream = false;
+	int width = 1920;
+	int height = 1080;
+};
+
+// Plugin output settings
+struct OutputSettings {
+	std::string whepToken;
+	std::optional<UdpPortRange> udpPortRange = UdpPortRange{};
+	std::string videoRateControl;
+	int nominalVideoBitrate = 0; // Zero for quality-based modes without a bitrate target.
+	std::string streamId;
+	std::string roomId;
+	std::string password;
+	std::string wssHost = DEFAULT_WSS_HOST;
+	std::string salt = DEFAULT_SALT;
+	VideoCodec videoCodec = VideoCodec::H264;
+	AudioCodec audioCodec = AudioCodec::Opus;
+	StreamQuality quality;
+	bool enableDataChannel = true;
+	bool autoReconnect = true;
+	int maxViewers = 10; // Max simultaneous P2P connections
+	std::vector<IceServer> customIceServers;
+	bool forceTurn = false;
+	VideoProtectionMode videoProtectionMode = VideoProtectionMode::Off;
+	bool enableAudioRed = false;
+	bool preserveSourceColorFormat = false;
+	bool enableAdaptiveBitrate = false;
+	int minimumAdaptiveBitrate = 500000;
+	bool enableRemote = false;
+	AutoInboundSettings autoInbound;
+};
+
+// Plugin source settings
+struct SourceSettings {
+	std::string streamId;
+	std::string roomId;
+	std::string password;
+	std::string wssHost = DEFAULT_WSS_HOST;
+	std::string salt = DEFAULT_SALT;
+	std::string customIceServersText;
+	bool useNativeReceiver = false;
+	bool enableDataChannel = true;
+	bool autoReconnect = true;
+	std::vector<IceServer> customIceServers;
+	bool forceTurn = false;
+};
+
+template <typename Owner> struct AsyncCallbackState {
+	std::atomic<Owner *> owner{nullptr};
+	std::atomic<uint32_t> inFlight{0};
+};
+
+template <typename Owner> class AsyncCallbackGuard
+{
+public:
+	explicit AsyncCallbackGuard(AsyncCallbackState<Owner> *state) : state_(state)
+	{
+		if (!state_) {
+			return;
+		}
+
+		state_->inFlight.fetch_add(1, std::memory_order_acq_rel);
+		owner_ = state_->owner.load(std::memory_order_acquire);
+		if (!owner_) {
+			state_->inFlight.fetch_sub(1, std::memory_order_acq_rel);
+			state_ = nullptr;
+		}
+	}
+
+	AsyncCallbackGuard(const AsyncCallbackGuard &) = delete;
+	AsyncCallbackGuard &operator=(const AsyncCallbackGuard &) = delete;
+
+	AsyncCallbackGuard(AsyncCallbackGuard &&other) noexcept : state_(other.state_), owner_(other.owner_)
+	{
+		other.state_ = nullptr;
+		other.owner_ = nullptr;
+	}
+
+	AsyncCallbackGuard &operator=(AsyncCallbackGuard &&other) noexcept
+	{
+		if (this == &other) {
+			return *this;
+		}
+
+		release();
+		state_ = other.state_;
+		owner_ = other.owner_;
+		other.state_ = nullptr;
+		other.owner_ = nullptr;
+		return *this;
+	}
+
+	~AsyncCallbackGuard() { release(); }
+
+	explicit operator bool() const { return owner_ != nullptr; }
+
+	Owner *owner() const { return owner_; }
+
+	static void detach(AsyncCallbackState<Owner> *state)
+	{
+		if (!state) {
+			return;
+		}
+
+		state->owner.store(nullptr, std::memory_order_release);
+	}
+
+	static bool waitForIdle(AsyncCallbackState<Owner> *state, int timeoutMs = 2000)
+	{
+		if (!state) {
+			return true;
+		}
+
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+		while (state->inFlight.load(std::memory_order_acquire) != 0) {
+			if (std::chrono::steady_clock::now() >= deadline) {
+				return false;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+
+		return true;
+	}
+
+private:
+	void release()
+	{
+		if (!state_) {
+			return;
+		}
+
+		state_->inFlight.fetch_sub(1, std::memory_order_acq_rel);
+		state_ = nullptr;
+		owner_ = nullptr;
+	}
+
+	AsyncCallbackState<Owner> *state_ = nullptr;
+	Owner *owner_ = nullptr;
+};
+
+// Utility function declarations (implemented in vdoninja-utils.cpp)
+std::string generateUUID();
+std::string generateSessionId();
+std::string hashStreamId(const std::string &streamId, const std::string &password,
+                         const std::string &salt = DEFAULT_SALT);
+std::string hashRoomId(const std::string &roomId, const std::string &password, const std::string &salt = DEFAULT_SALT);
+std::string sanitizeStreamId(const std::string &streamId);
+std::string toJson(const std::map<std::string, std::string> &data);
+std::map<std::string, std::string> fromJson(const std::string &json);
+
+} // namespace vdoninja

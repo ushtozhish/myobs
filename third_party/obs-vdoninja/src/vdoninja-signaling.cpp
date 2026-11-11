@@ -1,0 +1,2267 @@
+/*
+ * OBS VDO.Ninja Plugin
+ * WebSocket signaling client implementation
+ *
+ * This uses a simplified WebSocket client. In production, you would use
+ * a library like websocketpp, libwebsockets, or boost::beast.
+ * For this reference implementation, we'll use libdatachannel's WebSocket support.
+ */
+
+#include "vdoninja-signaling.h"
+
+#include <rtc/rtc.hpp>
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <chrono>
+#include <cstdlib>
+#include <cwchar>
+#include <fstream>
+#include <initializer_list>
+#include <new>
+#include <string>
+#include <vector>
+
+#if defined(__APPLE__) || defined(__linux__) || defined(__unix__)
+#define VDONINJA_HAS_DLADDR 1
+#include <dlfcn.h>
+#else
+#define VDONINJA_HAS_DLADDR 0
+#endif
+
+#if __has_include(<openssl/evp.h>) && __has_include(<openssl/rand.h>)
+#define VDONINJA_HAS_OPENSSL 1
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#else
+#define VDONINJA_HAS_OPENSSL 0
+#endif
+
+#if !VDONINJA_HAS_OPENSSL && defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+// bcrypt.h depends on Windows typedefs such as NTSTATUS being available first.
+// clang-format off
+#include <windows.h>
+#include <bcrypt.h>
+// clang-format on
+#endif
+
+namespace vdoninja
+{
+
+namespace
+{
+
+constexpr const char *kDefaultSignalingHostWithPort = "wss://wss.vdo.ninja:443";
+constexpr const char *kProxySignalingHost = "wss://proxywss.rtc.ninja:443";
+constexpr int kInitialConnectWaitMs = 12000;
+constexpr int kSignalingConnectionTimeoutMs = 4000;
+
+#ifdef TESTING_BUILD
+std::atomic<bool> gForceEncryptionFailureForTesting{false};
+#endif
+
+bool fileIsReadable(const std::string &path)
+{
+	if (path.empty()) {
+		return false;
+	}
+	std::ifstream stream(path, std::ios::binary);
+	return stream.good();
+}
+
+// Returns directories to search for a CA bundle shipped alongside this module.
+// The plugin binary's own directory is the primary location; on macOS the CA
+// bundle is installed there next to obs-vdoninja inside the .plugin bundle.
+std::vector<std::string> moduleDirectories()
+{
+	std::vector<std::string> dirs;
+#if VDONINJA_HAS_DLADDR
+	Dl_info info{};
+	// Use the address of a symbol defined in this shared object so dladdr
+	// resolves to the plugin module rather than to libc or another library.
+	if (dladdr(reinterpret_cast<const void *>(&fileIsReadable), &info) != 0 && info.dli_fname != nullptr) {
+		std::string modulePath = info.dli_fname;
+		const std::string::size_type slash = modulePath.find_last_of('/');
+		if (slash != std::string::npos) {
+			dirs.push_back(modulePath.substr(0, slash));
+		}
+	}
+#endif
+	return dirs;
+}
+
+// Resolves the CA-certificate bundle to hand to the TLS layer, or an empty
+// string to fall back to OpenSSL's compiled-in default trust store. Probes an
+// explicit SSL_CERT_FILE override, a bundle shipped with the plugin, then
+// well-known system locations. Computed once and cached.
+const std::string &resolveCaCertificateFile()
+{
+	static const std::string cached = []() -> std::string {
+		std::string envCertFile;
+		if (const char *env = std::getenv("SSL_CERT_FILE")) {
+			envCertFile = env;
+		}
+		for (const std::string &candidate : buildCaCertificateCandidatePaths(envCertFile, moduleDirectories())) {
+			if (fileIsReadable(candidate)) {
+				return candidate;
+			}
+		}
+		return std::string();
+	}();
+	return cached;
+}
+
+template <typename Fn> void runRtcCallbackNoexcept(const char *context, Fn &&fn)
+{
+	try {
+		fn();
+	} catch (const std::exception &e) {
+		logError("%s threw exception: %s", context, e.what());
+	} catch (...) {
+		logError("%s threw unknown exception", context);
+	}
+}
+
+std::string getAnyString(const JsonParser &json, const std::initializer_list<const char *> &keys)
+{
+	for (const char *key : keys) {
+		if (json.hasKey(key)) {
+			return json.getString(key);
+		}
+	}
+	return "";
+}
+
+std::string bytesToHex(const uint8_t *data, size_t size)
+{
+	static const char hex[] = "0123456789abcdef";
+	std::string out;
+	out.reserve(size * 2);
+	for (size_t i = 0; i < size; ++i) {
+		out.push_back(hex[(data[i] >> 4) & 0x0F]);
+		out.push_back(hex[data[i] & 0x0F]);
+	}
+	return out;
+}
+
+bool hexToBytes(const std::string &hex, std::vector<uint8_t> &out)
+{
+	if ((hex.size() % 2) != 0) {
+		return false;
+	}
+
+	auto nibble = [](char c) -> int {
+		if (c >= '0' && c <= '9') {
+			return c - '0';
+		}
+		if (c >= 'a' && c <= 'f') {
+			return 10 + (c - 'a');
+		}
+		if (c >= 'A' && c <= 'F') {
+			return 10 + (c - 'A');
+		}
+		return -1;
+	};
+
+	out.clear();
+	out.reserve(hex.size() / 2);
+	for (size_t i = 0; i < hex.size(); i += 2) {
+		const int hi = nibble(hex[i]);
+		const int lo = nibble(hex[i + 1]);
+		if (hi < 0 || lo < 0) {
+			return false;
+		}
+		out.push_back(static_cast<uint8_t>((hi << 4) | lo));
+	}
+	return true;
+}
+
+bool encryptAesCbcHex(const std::string &plaintext, const std::string &phrase, std::string &cipherHex,
+                      std::string &vectorHex)
+{
+#ifdef TESTING_BUILD
+	if (gForceEncryptionFailureForTesting.load()) {
+		return false;
+	}
+#endif
+#if VDONINJA_HAS_OPENSSL
+	if (phrase.empty()) {
+		return false;
+	}
+
+	std::vector<uint8_t> key;
+	if (!hexToBytes(sha256(phrase), key) || key.size() != 32) {
+		return false;
+	}
+
+	uint8_t iv[16] = {};
+	if (RAND_bytes(iv, static_cast<int>(sizeof(iv))) != 1) {
+		return false;
+	}
+
+	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+	if (!ctx) {
+		return false;
+	}
+
+	std::vector<uint8_t> out(plaintext.size() + EVP_MAX_BLOCK_LENGTH);
+	int outLen1 = 0;
+	int outLen2 = 0;
+	const bool ok = EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, key.data(), iv) == 1 &&
+	                EVP_EncryptUpdate(ctx, out.data(), &outLen1, reinterpret_cast<const uint8_t *>(plaintext.data()),
+	                                  static_cast<int>(plaintext.size())) == 1 &&
+	                EVP_EncryptFinal_ex(ctx, out.data() + outLen1, &outLen2) == 1;
+
+	EVP_CIPHER_CTX_free(ctx);
+	if (!ok) {
+		return false;
+	}
+
+	out.resize(static_cast<size_t>(outLen1 + outLen2));
+	cipherHex = bytesToHex(out.data(), out.size());
+	vectorHex = bytesToHex(iv, sizeof(iv));
+	return true;
+#elif defined(_WIN32)
+	if (phrase.empty()) {
+		return false;
+	}
+
+	const std::string keyHex = sha256(phrase);
+	std::vector<uint8_t> key;
+	if (!hexToBytes(keyHex, key) || key.size() != 32) {
+		return false;
+	}
+
+	BCRYPT_ALG_HANDLE algorithm = nullptr;
+	BCRYPT_KEY_HANDLE keyHandle = nullptr;
+	PUCHAR keyObject = nullptr;
+	DWORD keyObjectSize = 0;
+	DWORD blockLength = 0;
+	DWORD resultSize = 0;
+	std::vector<uint8_t> iv(16);
+	std::vector<uint8_t> encrypted;
+	bool ok = false;
+
+	auto cleanup = [&]() {
+		if (keyHandle) {
+			BCryptDestroyKey(keyHandle);
+		}
+		if (algorithm) {
+			BCryptCloseAlgorithmProvider(algorithm, 0);
+		}
+		delete[] keyObject;
+	};
+
+	if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_AES_ALGORITHM, nullptr, 0) != 0) {
+		cleanup();
+		return false;
+	}
+
+	if (BCryptSetProperty(algorithm, BCRYPT_CHAINING_MODE,
+	                      reinterpret_cast<PUCHAR>(const_cast<wchar_t *>(BCRYPT_CHAIN_MODE_CBC)),
+	                      static_cast<ULONG>((wcslen(BCRYPT_CHAIN_MODE_CBC) + 1) * sizeof(wchar_t)), 0) != 0) {
+		cleanup();
+		return false;
+	}
+
+	if (BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&keyObjectSize),
+	                      sizeof(keyObjectSize), &resultSize, 0) != 0 ||
+	    BCryptGetProperty(algorithm, BCRYPT_BLOCK_LENGTH, reinterpret_cast<PUCHAR>(&blockLength), sizeof(blockLength),
+	                      &resultSize, 0) != 0 ||
+	    blockLength != iv.size()) {
+		cleanup();
+		return false;
+	}
+
+	keyObject = new (std::nothrow) UCHAR[keyObjectSize];
+	if (!keyObject) {
+		cleanup();
+		return false;
+	}
+
+	if (BCryptGenerateSymmetricKey(algorithm, &keyHandle, keyObject, keyObjectSize, key.data(),
+	                               static_cast<ULONG>(key.size()), 0) != 0) {
+		cleanup();
+		return false;
+	}
+
+	if (BCryptGenRandom(nullptr, iv.data(), static_cast<ULONG>(iv.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+		cleanup();
+		return false;
+	}
+
+	std::vector<uint8_t> input(plaintext.begin(), plaintext.end());
+	DWORD encryptedSize = 0;
+	std::vector<uint8_t> ivWork = iv;
+	if (BCryptEncrypt(keyHandle, input.data(), static_cast<ULONG>(input.size()), nullptr, ivWork.data(),
+	                  static_cast<ULONG>(ivWork.size()), nullptr, 0, &encryptedSize, BCRYPT_BLOCK_PADDING) != 0) {
+		cleanup();
+		return false;
+	}
+
+	encrypted.resize(encryptedSize);
+	ivWork = iv;
+	if (BCryptEncrypt(keyHandle, input.data(), static_cast<ULONG>(input.size()), nullptr, ivWork.data(),
+	                  static_cast<ULONG>(ivWork.size()), encrypted.data(), encryptedSize, &encryptedSize,
+	                  BCRYPT_BLOCK_PADDING) != 0) {
+		cleanup();
+		return false;
+	}
+
+	encrypted.resize(encryptedSize);
+	cipherHex = bytesToHex(encrypted.data(), encrypted.size());
+	vectorHex = bytesToHex(iv.data(), iv.size());
+	ok = true;
+	cleanup();
+	return ok;
+#else
+	(void)plaintext;
+	(void)phrase;
+	(void)cipherHex;
+	(void)vectorHex;
+	return false;
+#endif
+}
+
+bool decryptAesCbcHex(const std::string &cipherHex, const std::string &vectorHex, const std::string &phrase,
+                      std::string &plaintext)
+{
+#if VDONINJA_HAS_OPENSSL
+	if (phrase.empty()) {
+		return false;
+	}
+
+	std::vector<uint8_t> key;
+	std::vector<uint8_t> cipher;
+	std::vector<uint8_t> iv;
+	if (!hexToBytes(sha256(phrase), key) || key.size() != 32 || !hexToBytes(cipherHex, cipher) ||
+	    !hexToBytes(vectorHex, iv) || iv.size() != 16) {
+		return false;
+	}
+
+	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+	if (!ctx) {
+		return false;
+	}
+
+	std::vector<uint8_t> out(cipher.size() + EVP_MAX_BLOCK_LENGTH);
+	int outLen1 = 0;
+	int outLen2 = 0;
+	const bool ok = EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, key.data(), iv.data()) == 1 &&
+	                EVP_DecryptUpdate(ctx, out.data(), &outLen1, cipher.data(), static_cast<int>(cipher.size())) == 1 &&
+	                EVP_DecryptFinal_ex(ctx, out.data() + outLen1, &outLen2) == 1;
+
+	EVP_CIPHER_CTX_free(ctx);
+	if (!ok) {
+		return false;
+	}
+
+	out.resize(static_cast<size_t>(outLen1 + outLen2));
+	plaintext.assign(reinterpret_cast<const char *>(out.data()), out.size());
+	return true;
+#elif defined(_WIN32)
+	if (phrase.empty()) {
+		return false;
+	}
+
+	const std::string keyHex = sha256(phrase);
+	std::vector<uint8_t> key;
+	std::vector<uint8_t> cipher;
+	std::vector<uint8_t> iv;
+	if (!hexToBytes(keyHex, key) || key.size() != 32 || !hexToBytes(cipherHex, cipher) || !hexToBytes(vectorHex, iv) ||
+	    iv.size() != 16) {
+		return false;
+	}
+
+	BCRYPT_ALG_HANDLE algorithm = nullptr;
+	BCRYPT_KEY_HANDLE keyHandle = nullptr;
+	PUCHAR keyObject = nullptr;
+	DWORD keyObjectSize = 0;
+	DWORD blockLength = 0;
+	DWORD resultSize = 0;
+	std::vector<uint8_t> output;
+
+	auto cleanup = [&]() {
+		if (keyHandle) {
+			BCryptDestroyKey(keyHandle);
+		}
+		if (algorithm) {
+			BCryptCloseAlgorithmProvider(algorithm, 0);
+		}
+		delete[] keyObject;
+	};
+
+	if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_AES_ALGORITHM, nullptr, 0) != 0) {
+		cleanup();
+		return false;
+	}
+
+	if (BCryptSetProperty(algorithm, BCRYPT_CHAINING_MODE,
+	                      reinterpret_cast<PUCHAR>(const_cast<wchar_t *>(BCRYPT_CHAIN_MODE_CBC)),
+	                      static_cast<ULONG>((wcslen(BCRYPT_CHAIN_MODE_CBC) + 1) * sizeof(wchar_t)), 0) != 0) {
+		cleanup();
+		return false;
+	}
+
+	if (BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&keyObjectSize),
+	                      sizeof(keyObjectSize), &resultSize, 0) != 0 ||
+	    BCryptGetProperty(algorithm, BCRYPT_BLOCK_LENGTH, reinterpret_cast<PUCHAR>(&blockLength), sizeof(blockLength),
+	                      &resultSize, 0) != 0 ||
+	    blockLength != iv.size()) {
+		cleanup();
+		return false;
+	}
+
+	keyObject = new (std::nothrow) UCHAR[keyObjectSize];
+	if (!keyObject) {
+		cleanup();
+		return false;
+	}
+
+	if (BCryptGenerateSymmetricKey(algorithm, &keyHandle, keyObject, keyObjectSize, key.data(),
+	                               static_cast<ULONG>(key.size()), 0) != 0) {
+		cleanup();
+		return false;
+	}
+
+	DWORD decryptedSize = 0;
+	std::vector<uint8_t> ivWork = iv;
+	if (BCryptDecrypt(keyHandle, cipher.data(), static_cast<ULONG>(cipher.size()), nullptr, ivWork.data(),
+	                  static_cast<ULONG>(ivWork.size()), nullptr, 0, &decryptedSize, BCRYPT_BLOCK_PADDING) != 0) {
+		cleanup();
+		return false;
+	}
+
+	output.resize(decryptedSize);
+	ivWork = iv;
+	if (BCryptDecrypt(keyHandle, cipher.data(), static_cast<ULONG>(cipher.size()), nullptr, ivWork.data(),
+	                  static_cast<ULONG>(ivWork.size()), output.data(), decryptedSize, &decryptedSize,
+	                  BCRYPT_BLOCK_PADDING) != 0) {
+		cleanup();
+		return false;
+	}
+
+	output.resize(decryptedSize);
+	plaintext.assign(reinterpret_cast<const char *>(output.data()), output.size());
+	cleanup();
+	return true;
+#else
+	(void)cipherHex;
+	(void)vectorHex;
+	(void)phrase;
+	(void)plaintext;
+	return false;
+#endif
+}
+
+std::string resolveEffectivePassword(const std::string &password, const std::string &defaultPassword, bool &disabled)
+{
+	const std::string trimmedPassword = trim(password);
+	if (isPasswordDisabledToken(trimmedPassword)) {
+		disabled = true;
+		return "";
+	}
+
+	disabled = false;
+	if (trimmedPassword.empty()) {
+		return defaultPassword;
+	}
+	return trimmedPassword;
+}
+
+std::string asciiLower(std::string value)
+{
+	for (char &c : value) {
+		c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	}
+	return value;
+}
+
+std::string normalizeSignalingHostForCompare(std::string host)
+{
+	host = asciiLower(trim(host));
+	while (host.size() > 1 && host.back() == '/') {
+		host.pop_back();
+	}
+	return host;
+}
+
+bool isDefaultSignalingHost(const std::string &host)
+{
+	const std::string normalized = normalizeSignalingHostForCompare(host);
+	return normalized.empty() || normalized == normalizeSignalingHostForCompare(DEFAULT_WSS_HOST) ||
+	       normalized == normalizeSignalingHostForCompare(kDefaultSignalingHostWithPort);
+}
+
+std::string normalizeIceCandidateType(const std::string &candidateType)
+{
+	return asciiLower(trim(candidateType)) == "remote" ? "remote" : "local";
+}
+
+std::vector<std::string> buildSignalingHosts(const std::string &configuredHost)
+{
+	std::string primary = trim(configuredHost);
+	if (primary.empty()) {
+		primary = DEFAULT_WSS_HOST;
+	}
+
+	std::vector<std::string> hosts;
+	hosts.push_back(primary);
+	if (isDefaultSignalingHost(primary) &&
+	    normalizeSignalingHostForCompare(primary) != normalizeSignalingHostForCompare(kProxySignalingHost)) {
+		hosts.push_back(kProxySignalingHost);
+	}
+	return hosts;
+}
+
+void logSignalingConnectDiagnostic(const std::string &host, const std::string &error, bool fallbackRemaining)
+{
+	const SignalingConnectErrorCategory category = classifySignalingConnectError(error);
+	logWarning("Signaling diagnostic: host=%s phase=connect category=%s fallback_remaining=%s clock=%s", host.c_str(),
+	           signalingConnectErrorCategoryName(category), fallbackRemaining ? "yes" : "no",
+	           formatTimestamp(currentTimeMs()).c_str());
+	logWarning("Signaling diagnostic: likely causes: %s", signalingConnectErrorLikelyCauses(category));
+}
+
+} // namespace
+
+const std::string &VDONinjaSignaling::getCaCertificateFile()
+{
+	return resolveCaCertificateFile();
+}
+
+VDONinjaSignaling::VDONinjaSignaling()
+{
+	localUUID_ = generateUUID();
+	logInfo("Signaling client created with UUID: %s", localUUID_.c_str());
+}
+
+VDONinjaSignaling::~VDONinjaSignaling()
+{
+	if (isUserCallbackOnCurrentThread()) {
+		logError("Signaling client cannot be destroyed from one of its own user callbacks");
+		std::terminate();
+	}
+	disconnect();
+	waitForAllUserCallbacks();
+	if (!joinWebSocketThread()) {
+		logError("Signaling client cannot be destroyed from its own WebSocket worker callback");
+		std::terminate();
+	}
+}
+
+bool VDONinjaSignaling::connect(const std::string &wssHost)
+{
+	if (connected_) {
+		logWarning("Already connected to signaling server");
+		return true;
+	}
+	if (wsThread_.joinable() && !shouldRun_) {
+		if (hasSocketUserCallbacks()) {
+			logError("Cannot reconnect signaling while a socket callback is active");
+			return false;
+		}
+		if (!joinWebSocketThread()) {
+			logError("Cannot reconnect signaling from its active WebSocket worker callback");
+			return false;
+		}
+	}
+	if (shouldRun_) {
+		logWarning("Signaling connection thread is already running");
+		return connected_;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		wssHosts_ = buildSignalingHosts(wssHost);
+		activeWssHostIndex_ = 0;
+		wssHost_ = wssHosts_.empty() ? DEFAULT_WSS_HOST : wssHosts_.front();
+		deferredConnectionError_.clear();
+		reconnectSuppressedByServer_ = false;
+		reconnectDeferredUntilMs_ = 0;
+	}
+	clearSendQueue();
+	shouldRun_ = true;
+	needsReconnect_ = false;
+	initialConnectionFinished_ = false;
+	disconnectNotified_ = true;
+	const uint64_t initialSocketEpoch = beginSocketEpoch();
+
+	// Start WebSocket thread
+	wsThread_ = std::thread(&VDONinjaSignaling::wsThreadFunc, this, initialSocketEpoch);
+
+	// Wait for initial connect/failover cycle to complete. Also bail out when
+	// disconnect() flips shouldRun_, so a teardown that joins the calling thread
+	// is not stuck here for the full timeout.
+	for (int waited = 0; waited < kInitialConnectWaitMs && !connected_ && !initialConnectionFinished_ && shouldRun_;
+	     waited += 100) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	}
+
+	return connected_;
+}
+
+void VDONinjaSignaling::disconnect()
+{
+	shouldRun_ = false;
+	// Invalidate the active socket before close(). libdatachannel may invoke its
+	// callbacks synchronously from close; those callbacks belong to the retired
+	// socket and must not schedule a reconnect or deliver lifecycle events.
+	beginSocketEpoch();
+	const bool wasConnected = connected_.exchange(false);
+
+	// Signal send thread to exit
+	clearSendQueue();
+	sendCv_.notify_all();
+
+	// A user callback may be executing on the WebSocket worker (the test stub
+	// does this synchronously) or on a libdatachannel callback thread whose
+	// reset waits for that callback. In either case, close/join here would form
+	// a cycle if the callback is waiting for disconnect() to return. The worker
+	// observes shouldRun_ and owns deferred socket destruction; reconnect and
+	// the destructor join that worker before reusing/destroying this object.
+	const bool teardownDeferred = hasSocketUserCallbacks();
+	if (!teardownDeferred) {
+		// Close WebSocket -- extract under the lock, then close outside it.
+		auto extracted = takeWebSocketHandle();
+		if (extracted) {
+			extracted->close();
+		}
+		if (!joinWebSocketThread()) {
+			logDebug("Deferring WebSocket worker join requested from its own thread");
+		}
+	} else {
+		logDebug("Deferring WebSocket close/join until active user callback returns");
+	}
+
+	// Reset state
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		currentRoom_ = RoomInfo{};
+		publishedStream_ = StreamInfo{};
+		viewingStreams_.clear();
+	}
+
+	logInfo("Disconnected from signaling server");
+
+	if (wasConnected) {
+		notifyDisconnected();
+	}
+}
+
+bool VDONinjaSignaling::isConnected() const
+{
+	return connected_;
+}
+
+uint64_t VDONinjaSignaling::beginSocketEpoch()
+{
+	std::lock_guard<std::mutex> lock(socketEpochMutex_);
+	return socketEpoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+
+uint64_t VDONinjaSignaling::beginSocketEpochIfCurrent(uint64_t expectedSocketEpoch)
+{
+	std::lock_guard<std::mutex> lock(socketEpochMutex_);
+	if (expectedSocketEpoch == 0 || !isCurrentSocketEpoch(expectedSocketEpoch)) {
+		return 0;
+	}
+	return socketEpoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+
+std::unique_lock<std::mutex> VDONinjaSignaling::acquireSocketCallback(uint64_t socketEpoch, uint64_t &wsSequence)
+{
+	std::unique_lock<std::mutex> lock(socketEpochMutex_);
+	if (socketEpoch == 0 || socketEpoch != socketEpoch_.load(std::memory_order_acquire)) {
+		lock.unlock();
+		return lock;
+	}
+	wsSequence = ++wsSequence_;
+	return lock;
+}
+
+bool VDONinjaSignaling::isCurrentSocketEpoch(uint64_t socketEpoch) const
+{
+	return socketEpoch != 0 && socketEpoch == socketEpoch_.load(std::memory_order_acquire);
+}
+
+VDONinjaSignaling::UserCallbackGuard::UserCallbackGuard(VDONinjaSignaling &owner, uint64_t socketEpoch) : owner_(&owner)
+{
+	active_ = owner_->beginUserCallback(socketEpoch, socketOrigin_);
+}
+
+VDONinjaSignaling::UserCallbackGuard::~UserCallbackGuard()
+{
+	if (active_) {
+		owner_->endUserCallback(socketOrigin_);
+	}
+}
+
+bool VDONinjaSignaling::beginUserCallback(uint64_t socketEpoch, bool &socketOrigin)
+{
+	socketOrigin = socketEpoch != 0;
+	std::unique_lock<std::mutex> epochLock;
+	if (socketOrigin) {
+		epochLock = std::unique_lock<std::mutex>(socketEpochMutex_);
+		if (!isCurrentSocketEpoch(socketEpoch)) {
+			return false;
+		}
+	}
+
+	std::lock_guard<std::mutex> callbackLock(userCallbackMutex_);
+	++userCallbacksInFlight_;
+	++userCallbackThreads_[std::this_thread::get_id()];
+	if (socketOrigin) {
+		++socketUserCallbacksInFlight_;
+	}
+	return true;
+}
+
+void VDONinjaSignaling::endUserCallback(bool socketOrigin)
+{
+	{
+		std::lock_guard<std::mutex> lock(userCallbackMutex_);
+		if (userCallbacksInFlight_ > 0) {
+			--userCallbacksInFlight_;
+		}
+		if (socketOrigin && socketUserCallbacksInFlight_ > 0) {
+			--socketUserCallbacksInFlight_;
+		}
+		auto callbackThread = userCallbackThreads_.find(std::this_thread::get_id());
+		if (callbackThread != userCallbackThreads_.end()) {
+			if (callbackThread->second > 1) {
+				--callbackThread->second;
+			} else {
+				userCallbackThreads_.erase(callbackThread);
+			}
+		}
+	}
+	userCallbackCv_.notify_all();
+}
+
+bool VDONinjaSignaling::hasSocketUserCallbacks() const
+{
+	std::lock_guard<std::mutex> lock(userCallbackMutex_);
+	return socketUserCallbacksInFlight_ != 0;
+}
+
+void VDONinjaSignaling::waitForSocketUserCallbacks()
+{
+	std::unique_lock<std::mutex> lock(userCallbackMutex_);
+	userCallbackCv_.wait(lock, [this]() { return socketUserCallbacksInFlight_ == 0; });
+}
+
+void VDONinjaSignaling::waitForAllUserCallbacks()
+{
+	std::unique_lock<std::mutex> lock(userCallbackMutex_);
+	userCallbackCv_.wait(lock, [this]() { return userCallbacksInFlight_ == 0; });
+}
+
+bool VDONinjaSignaling::isUserCallbackOnCurrentThread() const
+{
+	std::lock_guard<std::mutex> lock(userCallbackMutex_);
+	return userCallbackThreads_.find(std::this_thread::get_id()) != userCallbackThreads_.end();
+}
+
+bool VDONinjaSignaling::joinWebSocketThread()
+{
+	std::lock_guard<std::mutex> lock(wsThreadJoinMutex_);
+	if (!wsThread_.joinable()) {
+		return true;
+	}
+	if (wsThread_.get_id() == std::this_thread::get_id()) {
+		return false;
+	}
+	wsThread_.join();
+	return true;
+}
+
+std::shared_ptr<rtc::WebSocket> VDONinjaSignaling::takeWebSocketHandle(uint64_t expectedSocketEpoch)
+{
+	std::shared_ptr<rtc::WebSocket> *stored = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(handleMutex_);
+		if (wsHandle_ && (expectedSocketEpoch == 0 || wsHandleEpoch_ == expectedSocketEpoch)) {
+			stored = static_cast<std::shared_ptr<rtc::WebSocket> *>(wsHandle_);
+			wsHandle_ = nullptr;
+			wsHandleEpoch_ = 0;
+		}
+	}
+	if (!stored) {
+		return {};
+	}
+	auto socket = *stored;
+	delete stored;
+	return socket;
+}
+
+void VDONinjaSignaling::handleSocketOpen(uint64_t socketEpoch,
+                                         const std::shared_ptr<std::atomic<int>> &reconnectAttempts,
+                                         const std::string &host, const std::shared_ptr<std::atomic<bool>> &opened)
+{
+	uint64_t wsSequence = 0;
+	auto epochLease = acquireSocketCallback(socketEpoch, wsSequence);
+	if (!epochLease.owns_lock()) {
+		return;
+	}
+	(void)wsSequence;
+
+	logInfo("WebSocket connected to signaling server: %s", host.c_str());
+	opened->store(true);
+	connected_ = true;
+	disconnectNotified_ = false;
+	initialConnectionFinished_ = true;
+	reconnectAttempts->store(0, std::memory_order_relaxed);
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		deferredConnectionError_.clear();
+		reconnectSuppressedByServer_ = false;
+		reconnectDeferredUntilMs_ = 0;
+	}
+
+	OnConnectedCallback cb;
+	{
+		std::lock_guard<std::mutex> lock(callbackMutex_);
+		cb = onConnected_;
+	}
+	epochLease.unlock();
+	if (cb) {
+		invokeUserCallback(socketEpoch, [&]() { cb(); });
+	}
+}
+
+void VDONinjaSignaling::handleSocketClosed(uint64_t socketEpoch, const std::string &host,
+                                           const std::shared_ptr<std::atomic<bool>> &opened)
+{
+	uint64_t wsSequence = 0;
+	auto epochLease = acquireSocketCallback(socketEpoch, wsSequence);
+	if (!epochLease.owns_lock()) {
+		return;
+	}
+	(void)wsSequence;
+
+	if (opened->load()) {
+		logInfo("WebSocket closed: %s", host.c_str());
+	} else {
+		logWarning("WebSocket closed before opening: %s", host.c_str());
+	}
+	const bool wasConnected = connected_.exchange(false);
+	needsReconnect_ = true;
+	OnDisconnectedCallback disconnectedCb;
+	if (opened->load() && wasConnected && !disconnectNotified_.exchange(true)) {
+		std::lock_guard<std::mutex> lock(callbackMutex_);
+		disconnectedCb = onDisconnected_;
+	}
+	epochLease.unlock();
+
+	if (disconnectedCb) {
+		invokeUserCallback(socketEpoch, [&]() { disconnectedCb(); });
+	}
+	// Wake send loop so it can exit.
+	std::lock_guard<std::mutex> lock(sendMutex_);
+	sendCv_.notify_all();
+}
+
+void VDONinjaSignaling::handleSocketError(uint64_t socketEpoch, const std::string &host,
+                                          const std::shared_ptr<std::atomic<bool>> &opened, const std::string &error)
+{
+	uint64_t wsSequence = 0;
+	auto epochLease = acquireSocketCallback(socketEpoch, wsSequence);
+	if (!epochLease.owns_lock()) {
+		return;
+	}
+	(void)wsSequence;
+
+	bool tryFallback = false;
+	std::string report = error;
+	const bool failedBeforeOpen = !opened->load();
+	bool hasNextHost = false;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		hasNextHost = activeWssHostIndex_ + 1 < wssHosts_.size();
+		if (failedBeforeOpen && hasNextHost) {
+			deferredConnectionError_ = error;
+			tryFallback = true;
+		} else if (!deferredConnectionError_.empty()) {
+			report = "Built-in signaling server fallback failed; primary error: " + deferredConnectionError_ +
+			         "; fallback error: " + error;
+			deferredConnectionError_.clear();
+		}
+	}
+	std::shared_ptr<rtc::WebSocket> wsToClose;
+	if (failedBeforeOpen) {
+		needsReconnect_ = true;
+		{
+			std::lock_guard<std::mutex> lock(handleMutex_);
+			if (wsHandle_ && wsHandleEpoch_ == socketEpoch) {
+				wsToClose = *static_cast<std::shared_ptr<rtc::WebSocket> *>(wsHandle_);
+			}
+		}
+	}
+	OnErrorCallback cb;
+	if (!tryFallback) {
+		std::lock_guard<std::mutex> lock(callbackMutex_);
+		cb = onError_;
+	}
+	epochLease.unlock();
+
+	logError("WebSocket error from %s: %s", host.c_str(), error.c_str());
+	if (failedBeforeOpen) {
+		logSignalingConnectDiagnostic(host, error, hasNextHost);
+		sendCv_.notify_all();
+		// Close only the socket copied from this epoch. close() can invoke
+		// callbacks synchronously, so no signaling lock may be held here.
+		if (wsToClose) {
+			try {
+				wsToClose->close();
+			} catch (const std::exception &closeError) {
+				logWarning("WebSocket close after pre-open error failed for %s: %s", host.c_str(), closeError.what());
+			}
+		}
+	}
+	if (tryFallback) {
+		logWarning("Signaling connect to %s failed before open; trying fallback server", host.c_str());
+		return;
+	}
+	if (cb) {
+		invokeUserCallback(socketEpoch, [&]() { cb(report); });
+	}
+}
+
+void VDONinjaSignaling::handleSocketMessage(uint64_t socketEpoch, const std::string &message)
+{
+	uint64_t wsSequence = 0;
+	auto epochLease = acquireSocketCallback(socketEpoch, wsSequence);
+	if (!epochLease.owns_lock()) {
+		return;
+	}
+	epochLease.unlock();
+	processMessage(message, socketEpoch, wsSequence);
+}
+
+bool VDONinjaSignaling::reconnectTimerMayProceed(uint64_t socketEpoch)
+{
+	uint64_t wsSequence = 0;
+	return acquireSocketCallback(socketEpoch, wsSequence).owns_lock();
+}
+
+#ifdef TESTING_BUILD
+VDONinjaSignaling::SocketCallbacksForTesting VDONinjaSignaling::beginSocketAttemptForTesting()
+{
+	needsReconnect_ = false;
+	auto reconnectAttempts = std::make_shared<std::atomic<int>>(0);
+	auto opened = std::make_shared<std::atomic<bool>>(false);
+	const std::string host = "wss://socket-epoch.test";
+	const uint64_t socketEpoch = beginSocketEpoch();
+
+	SocketCallbacksForTesting callbacks;
+	callbacks.socketEpoch = socketEpoch;
+	callbacks.onOpen = [this, socketEpoch, reconnectAttempts, host, opened]() {
+		handleSocketOpen(socketEpoch, reconnectAttempts, host, opened);
+	};
+	callbacks.onMessage = [this, socketEpoch](const std::string &message) {
+		handleSocketMessage(socketEpoch, message);
+	};
+	callbacks.onClosed = [this, socketEpoch, host, opened]() { handleSocketClosed(socketEpoch, host, opened); };
+	callbacks.onError = [this, socketEpoch, host, opened](const std::string &error) {
+		handleSocketError(socketEpoch, host, opened, error);
+	};
+	callbacks.reconnectTimerMayProceed = [this, socketEpoch]() { return reconnectTimerMayProceed(socketEpoch); };
+	return callbacks;
+}
+
+bool VDONinjaSignaling::reconnectRequestedForTesting() const
+{
+	return needsReconnect_;
+}
+
+uint64_t VDONinjaSignaling::currentSocketEpochForTesting() const
+{
+	return socketEpoch_.load(std::memory_order_acquire);
+}
+
+void VDONinjaSignaling::setBeforeSocketStateCommitForTesting(std::function<void()> callback)
+{
+	std::lock_guard<std::mutex> lock(socketStateCommitHookMutex_);
+	beforeSocketStateCommitForTesting_ = std::move(callback);
+}
+
+bool VDONinjaSignaling::reconnectSuppressedForTesting() const
+{
+	std::lock_guard<std::mutex> lock(stateMutex_);
+	return reconnectSuppressedByServer_;
+}
+
+void VDONinjaSignaling::invokeSocketUserCallbackForTesting(std::function<void()> callback)
+{
+	const uint64_t socketEpoch = socketEpoch_.load(std::memory_order_acquire);
+	invokeUserCallback(socketEpoch, std::move(callback));
+}
+#endif
+
+void VDONinjaSignaling::runBeforeSocketStateCommitForTesting()
+{
+#ifdef TESTING_BUILD
+	std::function<void()> callback;
+	{
+		std::lock_guard<std::mutex> lock(socketStateCommitHookMutex_);
+		callback = beforeSocketStateCommitForTesting_;
+	}
+	if (callback) {
+		callback();
+	}
+#endif
+}
+
+void VDONinjaSignaling::wsThreadFunc(uint64_t initialSocketEpoch)
+{
+	auto reconnectAttempts = std::make_shared<std::atomic<int>>(0);
+	uint64_t latestSocketEpoch = 0;
+
+	while (shouldRun_) {
+		std::string host;
+		bool autoReconnect;
+		int maxAttempts;
+		bool reconnectSuppressedByServer;
+		int64_t reconnectDeferredUntilMs;
+		{
+			std::lock_guard<std::mutex> lock(stateMutex_);
+			if (!wssHosts_.empty() && activeWssHostIndex_ < wssHosts_.size()) {
+				host = wssHosts_[activeWssHostIndex_];
+			} else {
+				host = wssHost_;
+			}
+			wssHost_ = host;
+			autoReconnect = autoReconnect_;
+			maxAttempts = maxReconnectAttempts_;
+			reconnectSuppressedByServer = reconnectSuppressedByServer_;
+			reconnectDeferredUntilMs = reconnectDeferredUntilMs_;
+		}
+
+		logInfo("Connecting to signaling server: %s", host.c_str());
+		auto opened = std::make_shared<std::atomic<bool>>(false);
+		const uint64_t socketEpoch =
+		    latestSocketEpoch == 0 ? initialSocketEpoch : beginSocketEpochIfCurrent(latestSocketEpoch);
+		if (socketEpoch == 0) {
+			return;
+		}
+		bool mayStartAttempt = false;
+		if (!withCurrentSocketEpoch(socketEpoch,
+		                            [&]() {
+			                            mayStartAttempt = shouldRun_;
+			                            if (mayStartAttempt) {
+				                            needsReconnect_ = false;
+			                            }
+		                            }) ||
+		    !mayStartAttempt) {
+			return;
+		}
+		latestSocketEpoch = socketEpoch;
+
+		try {
+			rtc::WebSocket::Configuration wsConfig{};
+			wsConfig.disableTlsVerification = false;
+			wsConfig.proxyServer.reset();
+			wsConfig.protocols.clear();
+			wsConfig.connectionTimeout = std::chrono::milliseconds(kSignalingConnectionTimeoutMs);
+			wsConfig.pingInterval.reset();
+			wsConfig.maxOutstandingPings.reset();
+			// Point OpenSSL at an explicit CA bundle when one is available so a
+			// self-contained build can verify TLS peers even on machines that
+			// do not provide OpenSSL's default trust store (e.g. macOS without
+			// Homebrew). Falls back to the compiled-in default when empty.
+			{
+				const std::string &caFile = resolveCaCertificateFile();
+				if (caFile.empty()) {
+					wsConfig.caCertificatePemFile.reset();
+				} else {
+					wsConfig.caCertificatePemFile = caFile;
+					logDebug("Using CA certificate bundle for signaling TLS: %s", caFile.c_str());
+				}
+			}
+			wsConfig.certificatePemFile.reset();
+			wsConfig.keyPemFile.reset();
+			wsConfig.keyPemPass.reset();
+			wsConfig.maxMessageSize.reset();
+			auto ws = std::make_shared<rtc::WebSocket>(wsConfig);
+			{
+				std::lock_guard<std::mutex> lock(handleMutex_);
+				wsHandle_ = new std::shared_ptr<rtc::WebSocket>(ws);
+				wsHandleEpoch_ = socketEpoch;
+			}
+
+			ws->onOpen([this, socketEpoch, reconnectAttempts, host, opened]() {
+				runRtcCallbackNoexcept("WebSocket::onOpen",
+				                       [&]() { handleSocketOpen(socketEpoch, reconnectAttempts, host, opened); });
+			});
+
+			ws->onClosed([this, socketEpoch, host, opened]() {
+				runRtcCallbackNoexcept("WebSocket::onClosed", [&]() { handleSocketClosed(socketEpoch, host, opened); });
+			});
+
+			ws->onError([this, socketEpoch, host, opened](const std::string &error) {
+				runRtcCallbackNoexcept("WebSocket::onError",
+				                       [&]() { handleSocketError(socketEpoch, host, opened, error); });
+			});
+
+			ws->onMessage([this, socketEpoch](auto data) {
+				runRtcCallbackNoexcept("WebSocket::onMessage", [&]() {
+					if (std::holds_alternative<std::string>(data)) {
+						handleSocketMessage(socketEpoch, std::get<std::string>(data));
+					}
+				});
+			});
+
+			ws->open(host);
+
+			// Main loop - process send queue
+			while (shouldRun_ && !needsReconnect_ && isCurrentSocketEpoch(socketEpoch)) {
+				std::unique_lock<std::mutex> lock(sendMutex_);
+				sendCv_.wait_for(lock, std::chrono::milliseconds(100),
+				                 [this] { return !sendQueue_.empty() || !shouldRun_ || needsReconnect_.load(); });
+
+				while (!sendQueue_.empty() && connected_ && isCurrentSocketEpoch(socketEpoch)) {
+					std::string msg = sendQueue_.front();
+					sendQueue_.pop();
+					lock.unlock();
+
+					if (!shouldRun_ || !connected_ || !ws->isOpen()) {
+						logDebug("Dropping queued signaling message because WebSocket is closed");
+						lock.lock();
+						continue;
+					}
+
+					try {
+						ws->send(msg);
+						logDebug("Sent: %s", msg.c_str());
+					} catch (const std::exception &e) {
+						if (shouldRun_ && connected_ && ws->isOpen()) {
+							logError("Failed to send message: %s", e.what());
+						} else {
+							logDebug("Dropping queued signaling message during WebSocket shutdown: %s", e.what());
+						}
+					}
+
+					lock.lock();
+				}
+			}
+
+			waitForSocketUserCallbacks();
+			// Clean up this connection
+			(void)takeWebSocketHandle(socketEpoch);
+			clearSendQueue();
+		} catch (const std::exception &e) {
+			waitForSocketUserCallbacks();
+			bool tryFallback = false;
+			std::string report = e.what();
+			bool hasNextHost = false;
+			if (!withCurrentSocketEpoch(socketEpoch, [&]() {
+				    connected_ = false;
+				    std::lock_guard<std::mutex> lock(stateMutex_);
+				    hasNextHost = activeWssHostIndex_ + 1 < wssHosts_.size();
+				    if (!opened->load() && hasNextHost) {
+					    deferredConnectionError_ = e.what();
+					    tryFallback = true;
+				    } else if (!deferredConnectionError_.empty()) {
+					    report =
+					        "Built-in signaling server fallback failed; primary error: " + deferredConnectionError_ +
+					        "; fallback error: " + std::string(e.what());
+					    deferredConnectionError_.clear();
+				    }
+			    })) {
+				(void)takeWebSocketHandle(socketEpoch);
+				return;
+			}
+			logError("WebSocket thread error from %s: %s", host.c_str(), e.what());
+			if (!opened->load()) {
+				logSignalingConnectDiagnostic(host, e.what(), hasNextHost);
+			}
+
+			if (!tryFallback) {
+				OnErrorCallback cb;
+				{
+					std::lock_guard<std::mutex> lock(callbackMutex_);
+					cb = onError_;
+				}
+				if (cb) {
+					invokeUserCallback(socketEpoch, [&]() { cb(report); });
+				}
+			}
+
+			(void)takeWebSocketHandle(socketEpoch);
+			clearSendQueue();
+		}
+
+		const bool attemptOpened = opened->load();
+		bool tryFallbackHost = false;
+		bool initialAttemptFailed = false;
+		bool shouldReconnect = false;
+		std::string nextHost;
+		if (!withCurrentSocketEpoch(socketEpoch, [&]() {
+			    std::lock_guard<std::mutex> lock(stateMutex_);
+			    if (!attemptOpened && !connected_ && activeWssHostIndex_ + 1 < wssHosts_.size()) {
+				    ++activeWssHostIndex_;
+				    wssHost_ = wssHosts_[activeWssHostIndex_];
+				    nextHost = wssHost_;
+				    tryFallbackHost = true;
+				    needsReconnect_ = false;
+			    } else if (!connected_ && !initialConnectionFinished_) {
+				    initialConnectionFinished_ = true;
+				    initialAttemptFailed = true;
+			    } else {
+				    shouldReconnect = shouldRun_ && autoReconnect && needsReconnect_;
+				    if (shouldReconnect) {
+					    reconnectSuppressedByServer = reconnectSuppressedByServer_;
+					    reconnectDeferredUntilMs = reconnectDeferredUntilMs_;
+				    }
+			    }
+		    })) {
+			return;
+		}
+		if (tryFallbackHost) {
+			logWarning("Trying fallback signaling server: %s", nextHost.c_str());
+			continue;
+		}
+
+		if (initialAttemptFailed) {
+			break;
+		}
+
+		// Reconnect logic (iterative, not recursive)
+		if (!shouldReconnect) {
+			break;
+		}
+
+		if (reconnectSuppressedByServer) {
+			logWarning("Auto reconnect suppressed due to signaling server alert");
+			break;
+		}
+
+		const int attempt = reconnectAttempts->fetch_add(1, std::memory_order_relaxed) + 1;
+		if (attempt > maxAttempts) {
+			logError("Max reconnection attempts reached");
+			OnErrorCallback cb;
+			{
+				std::lock_guard<std::mutex> lock(callbackMutex_);
+				cb = onError_;
+			}
+			if (cb) {
+				invokeUserCallback(socketEpoch, [&]() { cb("Max reconnection attempts reached"); });
+			}
+			break;
+		}
+
+		int delay = computeSignalingReconnectDelayMs(attempt);
+		const int64_t now = currentTimeMs();
+		if (reconnectDeferredUntilMs > now) {
+			delay = static_cast<int>(std::max<int64_t>(delay, reconnectDeferredUntilMs - now));
+		}
+		logInfo("Reconnecting in %d ms (attempt %d/%d)", delay, attempt, maxAttempts);
+
+		// Sleep in small increments so we can respond to shouldRun_ going false
+		for (int waited = 0; waited < delay && shouldRun_ && isCurrentSocketEpoch(socketEpoch); waited += 100) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		}
+		if (!reconnectTimerMayProceed(socketEpoch)) {
+			return;
+		}
+	}
+
+	withCurrentSocketEpoch(latestSocketEpoch, [&]() {
+		shouldRun_ = false;
+		needsReconnect_ = false;
+		// Release any thread still waiting in connect() for the initial attempt.
+		initialConnectionFinished_ = true;
+	});
+}
+
+void VDONinjaSignaling::processMessage(const std::string &message, uint64_t socketEpoch, uint64_t wsSequence)
+{
+	logDebug("Received: %s", message.c_str());
+
+	auto dispatchParsed = [this, socketEpoch, wsSequence](const ParsedSignalMessage &parsed) {
+		auto socketEventIsCurrent = [this, socketEpoch]() {
+			return socketEpoch == 0 || isCurrentSocketEpoch(socketEpoch);
+		};
+		if (!socketEventIsCurrent()) {
+			return;
+		}
+		switch (parsed.kind) {
+		case ParsedSignalKind::Listing: {
+			logInfo("Received room listing");
+			std::vector<std::string> members;
+			if (!commitSocketState(socketEpoch, [&]() {
+				    std::lock_guard<std::mutex> lock(stateMutex_);
+				    currentRoom_.isJoined = true;
+				    currentRoom_.members = parsed.listingMembers;
+				    members = currentRoom_.members;
+			    })) {
+				break;
+			}
+			OnRoomJoinedCallback cb;
+			{
+				std::lock_guard<std::mutex> lock(callbackMutex_);
+				cb = onRoomJoined_;
+			}
+			if (cb) {
+				invokeUserCallback(socketEpoch, [&]() { cb(members); });
+			}
+			break;
+		}
+		case ParsedSignalKind::Offer: {
+			logInfo("Received offer from %s", parsed.uuid.c_str());
+			OnOfferCallback cb;
+			{
+				std::lock_guard<std::mutex> lock(callbackMutex_);
+				cb = onOffer_;
+			}
+			if (cb) {
+				invokeUserCallback(socketEpoch, [&]() { cb(parsed.uuid, parsed.sdp, parsed.session); });
+			}
+			break;
+		}
+		case ParsedSignalKind::Answer: {
+			logInfo("Received answer from %s", parsed.uuid.c_str());
+			OnAnswerCallback cb;
+			{
+				std::lock_guard<std::mutex> lock(callbackMutex_);
+				cb = onAnswer_;
+			}
+			if (cb) {
+				invokeUserCallback(socketEpoch, [&]() { cb(parsed.uuid, parsed.sdp, parsed.session); });
+			}
+			break;
+		}
+		case ParsedSignalKind::Candidate: {
+			logDebug("Received ICE candidate from %s", parsed.uuid.c_str());
+			OnIceCandidateCallback cb;
+			{
+				std::lock_guard<std::mutex> lock(callbackMutex_);
+				cb = onIceCandidate_;
+			}
+			if (cb) {
+				invokeUserCallback(socketEpoch,
+				                   [&]() { cb(parsed.uuid, parsed.candidate, parsed.mid, parsed.session); });
+			}
+			break;
+		}
+		case ParsedSignalKind::CandidatesBundle: {
+			logDebug("Received ICE candidate bundle from %s", parsed.uuid.c_str());
+			OnIceCandidateCallback cb;
+			{
+				std::lock_guard<std::mutex> lock(callbackMutex_);
+				cb = onIceCandidate_;
+			}
+			if (cb) {
+				for (const auto &candidate : parsed.candidates) {
+					if (!socketEventIsCurrent()) {
+						break;
+					}
+					invokeUserCallback(socketEpoch,
+					                   [&]() { cb(parsed.uuid, candidate.candidate, candidate.mid, parsed.session); });
+				}
+			}
+			break;
+		}
+		case ParsedSignalKind::Request:
+			handleRequest(parsed, socketEpoch);
+			break;
+		case ParsedSignalKind::Alert: {
+			logWarning("Server alert: %s", parsed.alert.c_str());
+			if (!commitSocketState(socketEpoch, [&]() { applyServerAlertPolicy(parsed.alert); })) {
+				break;
+			}
+			OnErrorCallback cb;
+			{
+				std::lock_guard<std::mutex> lock(callbackMutex_);
+				cb = onError_;
+			}
+			if (cb) {
+				invokeUserCallback(socketEpoch, [&]() { cb(parsed.alert); });
+			}
+			break;
+		}
+		case ParsedSignalKind::PeerCleanup: {
+			logInfo("Received peer cleanup for %s", parsed.uuid.c_str());
+			OnPeerCleanupCallback cb;
+			OnSignalingLifecycleEventCallback lifecycleCb;
+			{
+				std::lock_guard<std::mutex> lock(callbackMutex_);
+				cb = onPeerCleanup_;
+				lifecycleCb = onLifecycleEvent_;
+			}
+			if (!parsed.uuid.empty()) {
+				if (lifecycleCb) {
+					SignalingLifecycleEvent event;
+					event.kind = SignalingLifecycleEventKind::PeerCleanup;
+					event.socketEpoch = socketEpoch;
+					event.wsSequence = wsSequence;
+					event.uuid = parsed.uuid;
+					if (!parsed.session.empty()) {
+						event.session = parsed.session;
+					}
+					invokeUserCallback(socketEpoch, [&]() { lifecycleCb(event); });
+				}
+				if (cb && socketEventIsCurrent()) {
+					invokeUserCallback(socketEpoch, [&]() { cb(parsed.uuid, parsed.session); });
+				}
+			}
+			break;
+		}
+		case ParsedSignalKind::VideoAddedToRoom: {
+			logInfo("Stream added to room: %s by %s", parsed.streamId.c_str(), parsed.uuid.c_str());
+			if (!parsed.streamId.empty()) {
+				if (!commitSocketState(socketEpoch, [&]() {
+					    std::lock_guard<std::mutex> lock(stateMutex_);
+					    auto &members = currentRoom_.members;
+					    if (std::find(members.begin(), members.end(), parsed.streamId) == members.end()) {
+						    members.push_back(parsed.streamId);
+					    }
+				    })) {
+					break;
+				}
+			}
+			OnStreamAddedCallback cb;
+			{
+				std::lock_guard<std::mutex> lock(callbackMutex_);
+				cb = onStreamAdded_;
+			}
+			if (cb && socketEventIsCurrent()) {
+				invokeUserCallback(socketEpoch, [&]() { cb(parsed.streamId, parsed.uuid); });
+			}
+			break;
+		}
+		case ParsedSignalKind::VideoRemovedFromRoom: {
+			logInfo("Stream removed from room: %s by %s", parsed.streamId.c_str(), parsed.uuid.c_str());
+			if (!parsed.streamId.empty()) {
+				if (!commitSocketState(socketEpoch, [&]() {
+					    std::lock_guard<std::mutex> lock(stateMutex_);
+					    auto &members = currentRoom_.members;
+					    members.erase(std::remove(members.begin(), members.end(), parsed.streamId), members.end());
+				    })) {
+					break;
+				}
+			}
+			OnStreamRemovedCallback cb;
+			OnSignalingLifecycleEventCallback lifecycleCb;
+			{
+				std::lock_guard<std::mutex> lock(callbackMutex_);
+				cb = onStreamRemoved_;
+				lifecycleCb = onLifecycleEvent_;
+			}
+			if (lifecycleCb) {
+				SignalingLifecycleEvent event;
+				event.kind = SignalingLifecycleEventKind::StreamRemoved;
+				event.socketEpoch = socketEpoch;
+				event.wsSequence = wsSequence;
+				event.uuid = parsed.uuid;
+				event.streamId = parsed.streamId;
+				if (!parsed.session.empty()) {
+					event.session = parsed.session;
+				}
+				invokeUserCallback(socketEpoch, [&]() { lifecycleCb(event); });
+			}
+			if (cb && socketEventIsCurrent()) {
+				invokeUserCallback(socketEpoch, [&]() { cb(parsed.streamId, parsed.uuid); });
+			}
+			break;
+		}
+		default:
+			logDebug("Unknown message type");
+			break;
+		}
+	};
+
+	std::string defaultPassword;
+	std::string processSalt;
+	StreamInfo publishedStream;
+	RoomInfo currentRoom;
+	std::vector<StreamInfo> viewingStreams;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		defaultPassword = defaultPassword_;
+		processSalt = salt_;
+		publishedStream = publishedStream_;
+		currentRoom = currentRoom_;
+		viewingStreams.reserve(viewingStreams_.size());
+		for (const auto &entry : viewingStreams_) {
+			viewingStreams.push_back(entry.second);
+		}
+	}
+	JsonParser raw(message);
+	const std::string messageStreamId = getAnyString(raw, {"streamID", "streamId"});
+	std::string defaultPasswordCandidate;
+	const std::string trimmedDefaultPassword = trim(defaultPassword);
+	if (!trimmedDefaultPassword.empty() && !isPasswordDisabledToken(trimmedDefaultPassword)) {
+		defaultPasswordCandidate = jsEncodeURIComponent(trimmedDefaultPassword);
+	}
+	const std::vector<std::string> passwordCandidates = buildIncomingSignalingPasswordCandidates(
+	    messageStreamId, defaultPasswordCandidate, publishedStream, viewingStreams, currentRoom);
+	if (!passwordCandidates.empty() && raw.hasKey("vector")) {
+		const std::string vector = raw.getString("vector");
+		auto decryptWithCandidates = [&](const std::string &cipherText, std::string &plaintext) {
+			for (const auto &password : passwordCandidates) {
+				if (decryptAesCbcHex(cipherText, vector, password + processSalt, plaintext)) {
+					return true;
+				}
+			}
+			return false;
+		};
+
+		ParsedSignalMessage decryptedParsed;
+		decryptedParsed.uuid = getAnyString(raw, {"UUID", "uuid"});
+		decryptedParsed.session = getAnyString(raw, {"session"});
+		decryptedParsed.streamId = messageStreamId;
+
+		if (raw.hasKey("description")) {
+			const std::string encryptedDescription = raw.getRaw("description");
+			if (!encryptedDescription.empty() && encryptedDescription[0] != '{') {
+				std::string decryptedDescription;
+				if (!decryptWithCandidates(encryptedDescription, decryptedDescription)) {
+					logWarning("Failed to decrypt incoming SDP description");
+					return;
+				}
+
+				JsonParser desc(decryptedDescription);
+				decryptedParsed.type = getAnyString(desc, {"type"});
+				decryptedParsed.sdp = getAnyString(desc, {"sdp"});
+				if (decryptedParsed.type == "offer") {
+					decryptedParsed.kind = ParsedSignalKind::Offer;
+					dispatchParsed(decryptedParsed);
+					return;
+				}
+				if (decryptedParsed.type == "answer") {
+					decryptedParsed.kind = ParsedSignalKind::Answer;
+					dispatchParsed(decryptedParsed);
+					return;
+				}
+			}
+		}
+
+		if (raw.hasKey("candidate")) {
+			const std::string encryptedCandidate = raw.getRaw("candidate");
+			if (!encryptedCandidate.empty() && encryptedCandidate[0] != '{') {
+				std::string decryptedCandidate;
+				if (!decryptWithCandidates(encryptedCandidate, decryptedCandidate)) {
+					logWarning("Failed to decrypt incoming ICE candidate");
+					return;
+				}
+
+				JsonParser candidateJson(decryptedCandidate);
+				decryptedParsed.kind = ParsedSignalKind::Candidate;
+				decryptedParsed.candidate = getAnyString(candidateJson, {"candidate"});
+				decryptedParsed.mid = getAnyString(candidateJson, {"mid", "sdpMid", "smid", "rmid"});
+				dispatchParsed(decryptedParsed);
+				return;
+			}
+		}
+
+		if (raw.hasKey("candidates")) {
+			const std::string encryptedCandidates = raw.getRaw("candidates");
+			if (!encryptedCandidates.empty() && encryptedCandidates[0] != '[' && encryptedCandidates[0] != '{') {
+				std::string decryptedCandidates;
+				if (!decryptWithCandidates(encryptedCandidates, decryptedCandidates)) {
+					logWarning("Failed to decrypt incoming ICE candidate bundle");
+					return;
+				}
+
+				JsonParser wrapped("{\"candidates\":" + decryptedCandidates + "}");
+				decryptedParsed.kind = ParsedSignalKind::CandidatesBundle;
+				for (const auto &rawEntry : wrapped.getArray("candidates")) {
+					if (rawEntry.empty()) {
+						continue;
+					}
+
+					if (rawEntry[0] == '{') {
+						JsonParser candidateJson(rawEntry);
+						ParsedCandidate candidate;
+						candidate.candidate = getAnyString(candidateJson, {"candidate"});
+						candidate.mid = getAnyString(candidateJson, {"mid", "sdpMid", "smid", "rmid"});
+						if (!candidate.candidate.empty()) {
+							decryptedParsed.candidates.push_back(candidate);
+						}
+					} else {
+						ParsedCandidate candidate;
+						candidate.candidate = rawEntry;
+						candidate.mid = getAnyString(raw, {"mid", "sdpMid", "smid", "rmid"});
+						if (!candidate.candidate.empty()) {
+							decryptedParsed.candidates.push_back(candidate);
+						}
+					}
+				}
+
+				dispatchParsed(decryptedParsed);
+				return;
+			}
+		}
+	}
+
+	ParsedSignalMessage parsed;
+	std::string error;
+	if (!parseSignalingMessage(message, parsed, &error)) {
+		logError("Failed to parse message: %s", error.c_str());
+		return;
+	}
+	dispatchParsed(parsed);
+}
+
+void VDONinjaSignaling::processIncomingMessage(const std::string &message)
+{
+	processMessage(message);
+}
+
+void VDONinjaSignaling::applyServerAlertPolicy(const std::string &alert)
+{
+	const SignalingAlertPolicy policy = classifySignalingAlert(alert);
+	if (policy.category == SignalingAlertCategory::None) {
+		return;
+	}
+
+	std::lock_guard<std::mutex> lock(stateMutex_);
+	if (policy.suppressAutoReconnect) {
+		reconnectSuppressedByServer_ = true;
+	}
+	if (policy.signalingReconnectDelayMs > 0) {
+		reconnectDeferredUntilMs_ = std::max(reconnectDeferredUntilMs_,
+		                                     currentTimeMs() + static_cast<int64_t>(policy.signalingReconnectDelayMs));
+	}
+}
+
+void VDONinjaSignaling::handleRequest(const ParsedSignalMessage &message, uint64_t socketEpoch)
+{
+	logInfo("Received request: %s from %s", message.request.c_str(), message.uuid.c_str());
+	const std::string requestLower = asciiLower(message.request);
+
+	// VDO.Ninja requests publisher offers with offerSDP/sendoffer/play. For custom
+	// signaling compatibility, accept joinroom only when the request also carries
+	// a stream identifier; plain joinroom events are room-admission flow.
+	const bool joinroomOfferCompat = requestLower == "joinroom" && !message.streamId.empty();
+	if (requestLower == "icerestartrequest") {
+		OnIceRestartRequestCallback cb;
+		{
+			std::lock_guard<std::mutex> lock(callbackMutex_);
+			cb = onIceRestartRequest_;
+		}
+		if (cb) {
+			invokeUserCallback(socketEpoch, [&]() { cb(message.uuid, message.session); });
+		}
+		return;
+	}
+
+	if (requestLower == "offersdp" || requestLower == "sendoffer" || requestLower == "play" || joinroomOfferCompat) {
+		OnOfferRequestCallback cb;
+		{
+			std::lock_guard<std::mutex> lock(callbackMutex_);
+			cb = onOfferRequest_;
+		}
+		if (cb) {
+			invokeUserCallback(socketEpoch, [&]() { cb(message.uuid, message.session); });
+		}
+	}
+}
+
+void VDONinjaSignaling::sendMessage(const std::string &message)
+{
+	if (!connected_) {
+		logWarning("Cannot send message - not connected");
+		return;
+	}
+
+	std::lock_guard<std::mutex> lock(sendMutex_);
+	sendQueue_.push(message);
+	sendCv_.notify_one();
+}
+
+void VDONinjaSignaling::clearSendQueue()
+{
+	std::lock_guard<std::mutex> lock(sendMutex_);
+	while (!sendQueue_.empty()) {
+		sendQueue_.pop();
+	}
+}
+
+void VDONinjaSignaling::notifyDisconnected()
+{
+	if (disconnectNotified_.exchange(true)) {
+		return;
+	}
+
+	OnDisconnectedCallback cb;
+	{
+		std::lock_guard<std::mutex> lock(callbackMutex_);
+		cb = onDisconnected_;
+	}
+	if (cb) {
+		invokeUserCallback(0, [&]() { cb(); });
+	}
+}
+
+void VDONinjaSignaling::notifyError(const std::string &error)
+{
+	OnErrorCallback cb;
+	{
+		std::lock_guard<std::mutex> lock(callbackMutex_);
+		cb = onError_;
+	}
+	if (cb) {
+		invokeUserCallback(0, [&]() { cb(error); });
+	}
+}
+
+void VDONinjaSignaling::queueMessage(const std::string &message)
+{
+	sendMessage(message);
+}
+
+bool VDONinjaSignaling::joinRoom(const std::string &roomId, const std::string &password, bool claimDirector)
+{
+	if (!connected_) {
+		logError("Cannot join room - not connected");
+		return false;
+	}
+
+	std::string defaultPw;
+	std::string salt;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		defaultPw = defaultPassword_;
+		salt = salt_;
+	}
+
+	bool passwordDisabled = false;
+	std::string effectivePassword = resolveEffectivePassword(password, defaultPw, passwordDisabled);
+	std::string hashedRoom = passwordDisabled ? roomId : hashRoomId(roomId, effectivePassword, salt);
+
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		currentRoom_.roomId = roomId;
+		currentRoom_.hashedRoomId = hashedRoom;
+		// VDO.Ninja JS stores encodeURIComponent(password) as session.password,
+		// which is then used for AES encryption/decryption of SDP and ICE.
+		currentRoom_.password = passwordDisabled ? "" : jsEncodeURIComponent(effectivePassword);
+	}
+
+	JsonBuilder msg;
+	msg.add("request", "joinroom");
+	msg.add("roomid", hashedRoom);
+	if (claimDirector) {
+		msg.add("claim", true);
+	}
+
+	sendMessage(msg.build());
+	logInfo("Joining room: %s (resolved: %s, claim: %s)", roomId.c_str(), hashedRoom.c_str(),
+	        claimDirector ? "true" : "false");
+
+	return true;
+}
+
+bool VDONinjaSignaling::leaveRoom()
+{
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		if (!currentRoom_.isJoined && currentRoom_.roomId.empty() && currentRoom_.hashedRoomId.empty()) {
+			return true;
+		}
+		currentRoom_ = RoomInfo{};
+	}
+
+	logInfo("Cleared room state");
+	return true;
+}
+
+bool VDONinjaSignaling::isInRoom() const
+{
+	std::lock_guard<std::mutex> lock(stateMutex_);
+	return currentRoom_.isJoined;
+}
+
+std::string VDONinjaSignaling::getCurrentRoomId() const
+{
+	std::lock_guard<std::mutex> lock(stateMutex_);
+	return currentRoom_.roomId;
+}
+
+std::vector<std::string> VDONinjaSignaling::getCurrentRoomMembers() const
+{
+	std::lock_guard<std::mutex> lock(stateMutex_);
+	return currentRoom_.members;
+}
+
+bool VDONinjaSignaling::publishStream(const std::string &streamId, const std::string &password)
+{
+	if (!connected_) {
+		logError("Cannot publish - not connected");
+		return false;
+	}
+
+	std::string defaultPw;
+	std::string salt;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		defaultPw = defaultPassword_;
+		salt = salt_;
+	}
+
+	bool passwordDisabled = false;
+	std::string effectivePassword = resolveEffectivePassword(password, defaultPw, passwordDisabled);
+	std::string hashedStream = passwordDisabled ? streamId : hashStreamId(streamId, effectivePassword, salt);
+
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		publishedStream_.streamId = streamId;
+		publishedStream_.hashedStreamId = hashedStream;
+		publishedStream_.password = passwordDisabled ? "" : jsEncodeURIComponent(effectivePassword);
+		publishedStream_.isViewing = false;
+		publishedStream_.isPublishing = true;
+	}
+
+	JsonBuilder msg;
+	msg.add("request", "seed");
+	msg.add("streamID", hashedStream);
+
+	sendMessage(msg.build());
+	logInfo("Publishing stream: %s (hashed: %s)", streamId.c_str(), hashedStream.c_str());
+
+	return true;
+}
+
+bool VDONinjaSignaling::unpublishStream()
+{
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		if (!publishedStream_.isPublishing) {
+			return true;
+		}
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		publishedStream_ = StreamInfo{};
+	}
+
+	logInfo("Cleared published stream state");
+	return true;
+}
+
+bool VDONinjaSignaling::isPublishing() const
+{
+	std::lock_guard<std::mutex> lock(stateMutex_);
+	return publishedStream_.isPublishing;
+}
+
+std::string VDONinjaSignaling::getPublishedStreamId() const
+{
+	std::lock_guard<std::mutex> lock(stateMutex_);
+	return publishedStream_.streamId;
+}
+
+bool VDONinjaSignaling::viewStream(const std::string &streamId, const std::string &password)
+{
+	if (!connected_) {
+		logError("Cannot view stream - not connected");
+		return false;
+	}
+
+	std::string defaultPw;
+	std::string salt;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		defaultPw = defaultPassword_;
+		salt = salt_;
+	}
+
+	bool passwordDisabled = false;
+	std::string effectivePassword = resolveEffectivePassword(password, defaultPw, passwordDisabled);
+	std::string hashedStream = passwordDisabled ? streamId : hashStreamId(streamId, effectivePassword, salt);
+
+	StreamInfo stream;
+	stream.streamId = streamId;
+	stream.hashedStreamId = hashedStream;
+	stream.password = passwordDisabled ? "" : jsEncodeURIComponent(effectivePassword);
+	stream.isViewing = true;
+
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		viewingStreams_[streamId] = stream;
+	}
+
+	JsonBuilder msg;
+	msg.add("request", "play");
+	msg.add("streamID", hashedStream);
+
+	sendMessage(msg.build());
+	logInfo("Requesting to view stream: %s (hashed: %s)", streamId.c_str(), hashedStream.c_str());
+
+	return true;
+}
+
+bool VDONinjaSignaling::stopViewing(const std::string &streamId)
+{
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		auto it = viewingStreams_.find(streamId);
+		if (it == viewingStreams_.end()) {
+			return true;
+		}
+		viewingStreams_.erase(it);
+	}
+
+	logInfo("Cleared viewing stream state: %s", streamId.c_str());
+	return true;
+}
+
+std::string VDONinjaSignaling::getActiveSignalingPassword() const
+{
+	std::lock_guard<std::mutex> lock(stateMutex_);
+	if (publishedStream_.isPublishing && !publishedStream_.password.empty()) {
+		return publishedStream_.password;
+	}
+
+	for (const auto &entry : viewingStreams_) {
+		if (entry.second.isViewing && !entry.second.password.empty()) {
+			return entry.second.password;
+		}
+	}
+
+	if (currentRoom_.isJoined && !currentRoom_.password.empty()) {
+		return currentRoom_.password;
+	}
+
+	return "";
+}
+
+void VDONinjaSignaling::sendOffer(const std::string &uuid, const std::string &sdp, const std::string &session)
+{
+	JsonBuilder description;
+	description.add("type", "offer");
+	description.add("sdp", sdp);
+
+	std::string hashedStreamId;
+	std::string salt;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		if (publishedStream_.isPublishing && !publishedStream_.hashedStreamId.empty()) {
+			hashedStreamId = publishedStream_.hashedStreamId;
+		}
+		salt = salt_;
+	}
+
+	JsonBuilder msg;
+	msg.add("UUID", uuid);
+	msg.add("session", session);
+	if (!hashedStreamId.empty()) {
+		msg.add("streamID", hashedStreamId);
+	}
+
+	const std::string activePassword = getActiveSignalingPassword();
+	if (!activePassword.empty()) {
+		std::string encryptedDescription;
+		std::string vector;
+		if (encryptAesCbcHex(description.build(), activePassword + salt, encryptedDescription, vector)) {
+			msg.add("description", encryptedDescription);
+			msg.add("vector", vector);
+		} else {
+			logError("Failed to encrypt offer SDP; refusing plaintext fallback");
+			notifyError("Failed to encrypt offer SDP");
+			return;
+		}
+	} else {
+		msg.addRaw("description", description.build());
+	}
+
+	sendMessage(msg.build());
+	logDebug("Sent offer to %s", uuid.c_str());
+}
+
+void VDONinjaSignaling::sendAnswer(const std::string &uuid, const std::string &sdp, const std::string &session)
+{
+	JsonBuilder description;
+	description.add("type", "answer");
+	description.add("sdp", sdp);
+
+	std::string salt;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		salt = salt_;
+	}
+
+	JsonBuilder msg;
+	msg.add("UUID", uuid);
+	msg.add("session", session);
+
+	const std::string activePassword = getActiveSignalingPassword();
+	if (!activePassword.empty()) {
+		std::string encryptedDescription;
+		std::string vector;
+		if (encryptAesCbcHex(description.build(), activePassword + salt, encryptedDescription, vector)) {
+			msg.add("description", encryptedDescription);
+			msg.add("vector", vector);
+		} else {
+			logError("Failed to encrypt answer SDP; refusing plaintext fallback");
+			notifyError("Failed to encrypt answer SDP");
+			return;
+		}
+	} else {
+		msg.addRaw("description", description.build());
+	}
+
+	sendMessage(msg.build());
+	logDebug("Sent answer to %s", uuid.c_str());
+}
+
+void VDONinjaSignaling::sendAnswerViaDataChannel(const std::shared_ptr<rtc::DataChannel> &dc, const std::string &uuid,
+                                                 const std::string &sdp, const std::string &session)
+{
+	if (!dc) {
+		return;
+	}
+
+	JsonBuilder description;
+	description.add("type", "answer");
+	description.add("sdp", sdp);
+
+	std::string salt;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		salt = salt_;
+	}
+
+	JsonBuilder msg;
+	msg.add("UUID", uuid);
+	msg.add("session", session);
+
+	const std::string activePassword = getActiveSignalingPassword();
+	if (!activePassword.empty()) {
+		std::string encryptedDescription;
+		std::string vector;
+		if (encryptAesCbcHex(description.build(), activePassword + salt, encryptedDescription, vector)) {
+			msg.add("description", encryptedDescription);
+			msg.add("vector", vector);
+		} else {
+			logError("Failed to encrypt answer SDP for datachannel; refusing plaintext fallback");
+			notifyError("Failed to encrypt answer SDP for datachannel");
+			return;
+		}
+	} else {
+		msg.addRaw("description", description.build());
+	}
+
+	dc->send(msg.build());
+	logDebug("Sent answer to %s via datachannel", uuid.c_str());
+}
+
+void VDONinjaSignaling::sendIceCandidate(const std::string &uuid, const std::string &candidate, const std::string &mid,
+                                         const std::string &session, const std::string &candidateType)
+{
+	std::string salt;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		salt = salt_;
+	}
+
+	JsonBuilder msg;
+	msg.add("UUID", uuid);
+	msg.add("type", normalizeIceCandidateType(candidateType));
+	msg.add("session", session);
+
+	std::string normalizedCandidate = candidate;
+	if (normalizedCandidate.rfind("a=", 0) == 0) {
+		normalizedCandidate.erase(0, 2);
+	}
+
+	const std::string activePassword = getActiveSignalingPassword();
+	if (!activePassword.empty()) {
+		JsonBuilder candidatePayload;
+		candidatePayload.add("candidate", normalizedCandidate);
+		candidatePayload.add("mid", mid);
+		candidatePayload.add("sdpMid", mid);
+
+		std::string encryptedCandidate;
+		std::string vector;
+		if (encryptAesCbcHex(candidatePayload.build(), activePassword + salt, encryptedCandidate, vector)) {
+			msg.add("candidate", encryptedCandidate);
+			msg.add("vector", vector);
+		} else {
+			logError("Failed to encrypt ICE candidate; refusing plaintext fallback");
+			notifyError("Failed to encrypt ICE candidate");
+			return;
+		}
+	} else {
+		JsonBuilder candidateObj;
+		candidateObj.add("candidate", normalizedCandidate);
+		candidateObj.add("mid", mid);
+		candidateObj.add("sdpMid", mid);
+		msg.addRaw("candidate", candidateObj.build());
+	}
+
+	sendMessage(msg.build());
+	logDebug("Sent ICE candidate to %s", uuid.c_str());
+}
+
+bool VDONinjaSignaling::sendIceCandidateViaDataChannel(const std::shared_ptr<rtc::DataChannel> &dc,
+                                                       const std::string &uuid, const std::string &candidate,
+                                                       const std::string &mid, const std::string &session,
+                                                       const std::string &candidateType)
+{
+	if (!dc || !dc->isOpen()) {
+		return false;
+	}
+
+	std::string salt;
+	{
+		std::lock_guard<std::mutex> lock(stateMutex_);
+		salt = salt_;
+	}
+
+	JsonBuilder msg;
+	msg.add("UUID", uuid);
+	msg.add("type", normalizeIceCandidateType(candidateType));
+	msg.add("session", session);
+
+	std::string normalizedCandidate = candidate;
+	if (normalizedCandidate.rfind("a=", 0) == 0) {
+		normalizedCandidate.erase(0, 2);
+	}
+
+	const std::string activePassword = getActiveSignalingPassword();
+	if (!activePassword.empty()) {
+		JsonBuilder candidatePayload;
+		candidatePayload.add("candidate", normalizedCandidate);
+		candidatePayload.add("mid", mid);
+		candidatePayload.add("sdpMid", mid);
+
+		std::string encryptedCandidate;
+		std::string vector;
+		if (encryptAesCbcHex(candidatePayload.build(), activePassword + salt, encryptedCandidate, vector)) {
+			msg.add("candidate", encryptedCandidate);
+			msg.add("vector", vector);
+		} else {
+			logError("Failed to encrypt ICE candidate for datachannel; refusing plaintext fallback");
+			notifyError("Failed to encrypt ICE candidate for datachannel");
+			return false;
+		}
+	} else {
+		JsonBuilder candidateObj;
+		candidateObj.add("candidate", normalizedCandidate);
+		candidateObj.add("mid", mid);
+		candidateObj.add("sdpMid", mid);
+		msg.addRaw("candidate", candidateObj.build());
+	}
+
+	try {
+		dc->send(msg.build());
+		logDebug("Sent ICE candidate to %s via datachannel", uuid.c_str());
+		return true;
+	} catch (const std::exception &e) {
+		logDebug("Failed to send ICE candidate to %s via datachannel: %s", uuid.c_str(), e.what());
+	}
+	return false;
+}
+
+void VDONinjaSignaling::setOnConnected(OnConnectedCallback callback)
+{
+	std::lock_guard<std::mutex> lock(callbackMutex_);
+	onConnected_ = callback;
+}
+void VDONinjaSignaling::setOnDisconnected(OnDisconnectedCallback callback)
+{
+	std::lock_guard<std::mutex> lock(callbackMutex_);
+	onDisconnected_ = callback;
+}
+#ifdef TESTING_BUILD
+void VDONinjaSignaling::setEncryptionFailureForTesting(bool forceFailure)
+{
+	gForceEncryptionFailureForTesting.store(forceFailure);
+}
+#endif
+void VDONinjaSignaling::setOnError(OnErrorCallback callback)
+{
+	std::lock_guard<std::mutex> lock(callbackMutex_);
+	onError_ = callback;
+}
+void VDONinjaSignaling::setOnOffer(OnOfferCallback callback)
+{
+	std::lock_guard<std::mutex> lock(callbackMutex_);
+	onOffer_ = callback;
+}
+void VDONinjaSignaling::setOnAnswer(OnAnswerCallback callback)
+{
+	std::lock_guard<std::mutex> lock(callbackMutex_);
+	onAnswer_ = callback;
+}
+void VDONinjaSignaling::setOnOfferRequest(OnOfferRequestCallback callback)
+{
+	std::lock_guard<std::mutex> lock(callbackMutex_);
+	onOfferRequest_ = callback;
+}
+void VDONinjaSignaling::setOnIceRestartRequest(OnIceRestartRequestCallback callback)
+{
+	std::lock_guard<std::mutex> lock(callbackMutex_);
+	onIceRestartRequest_ = callback;
+}
+void VDONinjaSignaling::setOnIceCandidate(OnIceCandidateCallback callback)
+{
+	std::lock_guard<std::mutex> lock(callbackMutex_);
+	onIceCandidate_ = callback;
+}
+void VDONinjaSignaling::setOnRoomJoined(OnRoomJoinedCallback callback)
+{
+	std::lock_guard<std::mutex> lock(callbackMutex_);
+	onRoomJoined_ = callback;
+}
+void VDONinjaSignaling::setOnStreamAdded(OnStreamAddedCallback callback)
+{
+	std::lock_guard<std::mutex> lock(callbackMutex_);
+	onStreamAdded_ = callback;
+}
+void VDONinjaSignaling::setOnStreamRemoved(OnStreamRemovedCallback callback)
+{
+	std::lock_guard<std::mutex> lock(callbackMutex_);
+	onStreamRemoved_ = callback;
+}
+void VDONinjaSignaling::setOnPeerCleanup(OnPeerCleanupCallback callback)
+{
+	std::lock_guard<std::mutex> lock(callbackMutex_);
+	onPeerCleanup_ = callback;
+}
+void VDONinjaSignaling::setOnLifecycleEvent(OnSignalingLifecycleEventCallback callback)
+{
+	std::lock_guard<std::mutex> lock(callbackMutex_);
+	onLifecycleEvent_ = callback;
+}
+void VDONinjaSignaling::setOnData(OnDataCallback callback)
+{
+	std::lock_guard<std::mutex> lock(callbackMutex_);
+	onData_ = callback;
+}
+
+void VDONinjaSignaling::setSalt(const std::string &salt)
+{
+	std::lock_guard<std::mutex> lock(stateMutex_);
+	salt_ = trim(salt);
+	if (salt_.empty()) {
+		salt_ = DEFAULT_SALT;
+	}
+}
+void VDONinjaSignaling::setDefaultPassword(const std::string &password)
+{
+	std::lock_guard<std::mutex> lock(stateMutex_);
+	defaultPassword_ = password;
+}
+void VDONinjaSignaling::setAutoReconnect(bool enable, int maxAttempts)
+{
+	std::lock_guard<std::mutex> lock(stateMutex_);
+	autoReconnect_ = enable;
+	maxReconnectAttempts_ = maxAttempts;
+}
+
+std::string VDONinjaSignaling::getLocalUUID() const
+{
+	return localUUID_;
+}
+
+} // namespace vdoninja

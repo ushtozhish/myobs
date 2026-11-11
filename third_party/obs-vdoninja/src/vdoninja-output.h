@@ -1,0 +1,233 @@
+/*
+ * OBS VDO.Ninja Plugin
+ * Output module for publishing streams to VDO.Ninja
+ *
+ * This creates an OBS output that can be used as a streaming destination,
+ * similar to RTMP or WHIP outputs.
+ */
+
+#pragma once
+
+#include <obs-module.h>
+
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <set>
+#include <thread>
+
+#include "vdoninja-auto-scene-manager.h"
+#include "vdoninja-bitrate-controller.h"
+#include "vdoninja-common.h"
+#include "vdoninja-data-channel.h"
+#include "vdoninja-peer-manager.h"
+#include "vdoninja-rtp-utils.h"
+#include "vdoninja-signaling.h"
+#include "vdoninja-whep-host.h"
+
+namespace vdoninja
+{
+
+class VDONinjaOutput
+{
+public:
+	struct ViewerRuntimeSnapshot {
+		std::string uuid;
+		std::string streamId;
+		std::string role;
+		std::string state;
+		bool hasDataChannel = false;
+		bool audioSendEnabled = true;
+		bool videoSendEnabled = true;
+		std::string lastStats;
+		int64_t lastStatsTimestampMs = 0;
+	};
+
+	VDONinjaOutput(obs_data_t *settings, obs_output_t *output);
+	~VDONinjaOutput();
+
+	// OBS output lifecycle
+	bool start();
+	void stop(bool signalStop = false);
+	void data(encoder_packet *packet);
+
+	// Get statistics
+	uint64_t getTotalBytes() const;
+	int getConnectTime() const;
+	int getViewerCount() const;
+	int getMaxViewers() const;
+	bool isRunning() const;
+	bool isConnected() const;
+	int64_t getUptimeMs() const;
+	OutputSettings getSettingsSnapshot() const;
+	std::vector<ViewerRuntimeSnapshot> getViewerSnapshots() const;
+
+	// Tally aggregation across all peers
+	TallyState getAggregatedTally() const;
+
+	// Remote control enabled flag (read from settings)
+	bool isRemoteControlEnabled() const;
+
+	// Update settings
+	void update(obs_data_t *settings);
+
+private:
+	// Initialize from settings
+	void loadSettings(obs_data_t *settings);
+
+	// Start/stop thread functions
+	void startThread(OutputSettings settingsSnap);
+	void stopWhepHost();
+	void stopThread();
+
+	// Handle encoding
+	enum class MediaFrameType { Audio, Video };
+	struct QueuedMediaFrame {
+		MediaFrameType type = MediaFrameType::Video;
+		std::vector<uint8_t> payload;
+		uint32_t timestamp = 0;
+		bool keyframe = false;
+		uint64_t queuedAtMs = 0;
+	};
+
+	void startMediaSendWorker();
+	void stopMediaSendWorker();
+	void mediaSendThread();
+	void enqueueMediaFrame(QueuedMediaFrame frame);
+	void processAudioPacket(encoder_packet *packet);
+	void processVideoPacket(encoder_packet *packet);
+	void sendInitialPeerInfo(const std::string &uuid);
+	void primeViewerWithCachedKeyframe(const std::string &uuid);
+	void noteKeyframeRequest(const std::string &uuid, const char *transport);
+	void startPublishSummaryWorker();
+	void stopPublishSummaryWorker(bool flush);
+	void publishSummaryThread();
+	void maybeLogPublishSummary(bool force = false);
+	void configureBitrateAdaptation(const OutputSettings &settings, int encoderBitrateBitsPerSecond);
+	void configureH264ProfileLevelId();
+	void maybeAdaptBitrate();
+	void maybeSettleAdaptivePacer();
+	void applyAdaptiveBitrate(uint64_t bitrateBitsPerSecond, uint64_t estimateBitsPerSecond);
+	void restoreEncoderBitrate();
+	void resetPublishTelemetry();
+	std::string buildInitialInfoMessage() const;
+	std::string buildObsStateMessage() const;
+	std::string buildRemoteStatsMessage(const std::string &requestingUuid) const;
+	std::string buildConnectionMapMessage(const std::string &requestingUuid) const;
+	void sendRemoteStatsSnapshotToPeer(const std::string &uuid);
+	void sendRejectedControlToPeer(const std::string &uuid, const std::string &controlName);
+	void addRemoteStatsSubscriber(const std::string &uuid);
+	void removeRemoteStatsSubscriber(const std::string &uuid);
+	void stopRemoteStatsWorker();
+	void remoteStatsThread();
+	void sendObsStateToPeer(const std::string &uuid);
+	void queueObsStateToPeer(const std::string &uuid);
+	void drainAsyncCallbacks();
+
+	// OBS output handle
+	obs_output_t *output_;
+
+	// Settings (protected by settingsMutex_)
+	OutputSettings settings_;
+	mutable std::mutex settingsMutex_;
+
+	// Components
+	std::unique_ptr<VDONinjaSignaling> signaling_;
+	std::unique_ptr<VDONinjaPeerManager> peerManager_;
+	// Created by the start thread, taken over by stop() (protected by whepHostMutex_).
+	std::unique_ptr<VDONinjaWhepHost> whepHost_;
+	std::mutex whepHostMutex_;
+	std::unique_ptr<VDOAutoSceneManager> autoSceneManager_;
+	VDONinjaDataChannel dataChannel_;
+	std::shared_ptr<AsyncCallbackState<VDONinjaOutput>> callbackState_;
+
+	// State
+	std::atomic<bool> running_{false};
+	std::atomic<bool> connected_{false};
+	std::atomic<bool> capturing_{false};
+	// Serializes start()/stop()/destruction so a concurrent stop can never
+	// return early while another thread is still tearing down, leaving joinable
+	// threads behind for the destructor (std::terminate).
+	std::mutex startStopMutex_;
+	std::thread startStopThread_;
+	std::thread mediaSendThread_;
+	std::mutex mediaSendMutex_;
+	std::condition_variable mediaSendCv_;
+	std::deque<QueuedMediaFrame> mediaSendQueue_;
+	bool mediaSendWorkerRunning_ = false;
+	std::atomic<uint64_t> droppedMediaFrames_{0};
+	std::atomic<uint64_t> droppedAudioMediaFrames_{0};
+	std::atomic<uint64_t> maxMediaQueueDepth_{0};
+	std::atomic<uint64_t> maxAudioQueueDelayMs_{0};
+
+	// Statistics
+	std::atomic<uint64_t> totalBytes_{0};
+	std::atomic<int64_t> connectTimeMs_{0};
+	std::atomic<int64_t> startTimeMs_{0};
+
+	// Data-channel telemetry cache (per peer)
+	mutable std::mutex telemetryMutex_;
+	std::map<std::string, std::string> lastPeerStats_;
+	std::map<std::string, int64_t> lastPeerStatsTimestampMs_;
+	std::mutex remoteStatsMutex_;
+	std::condition_variable remoteStatsCv_;
+	std::set<std::string> remoteStatsSubscribers_;
+	std::thread remoteStatsThread_;
+	bool remoteStatsWorkerRunning_ = false;
+
+	// Latest keyframe cache for fast viewer warm-up and keyframe requests.
+	mutable std::mutex keyframeCacheMutex_;
+	std::vector<uint8_t> cachedKeyframe_;
+	uint32_t cachedKeyframeTimestamp_ = 0;
+	uint32_t lastVideoRtpTimestamp_ = 0;
+	bool hasLastVideoRtpTimestamp_ = false;
+	uint32_t lastAudioRtpTimestamp_ = 0;
+	bool hasLastAudioRtpTimestamp_ = false;
+
+	// Observed encoder keyframe cadence. The GOP length bounds how long a viewer
+	// stays broken after packet loss, so an oversized interval is worth surfacing
+	// even when the service settings that should cap it were bypassed.
+	int64_t lastKeyframeWallClockMs_ = 0;
+	int longKeyframeGaps_ = 0;
+	bool loggedKeyframeIntervalWarning_ = false;
+
+	// Rolling publish telemetry, flushed to one log line at a fixed interval.
+	// Encoder cadence, keyframe burst size and viewer keyframe requests are the
+	// three things that explain most "it stutters every few seconds" reports, and
+	// none of them could previously be read off a user's log. Packet callbacks
+	// only update the protected counters; a worker performs snapshotting and
+	// synchronous OBS logfile I/O away from libobs's serialized A/V callback.
+	std::mutex publishSummaryMutex_;
+	std::condition_variable publishSummaryCv_;
+	std::thread publishSummaryThread_;
+	bool publishSummaryWorkerRunning_ = false;
+	int64_t lastPublishSummaryMs_ = 0;
+	uint64_t summaryVideoFrames_ = 0;
+	uint64_t summaryVideoBytes_ = 0;
+	uint64_t summaryKeyframes_ = 0;
+	uint64_t summaryKeyframeBytes_ = 0;
+	uint64_t summaryMaxKeyframeBytes_ = 0;
+	uint64_t summaryAudioBytes_ = 0;
+	RtpTimestampStepTracker audioTimestampSteps_{960};
+	std::atomic<uint64_t> keyframeRequests_{0};
+	std::atomic<uint64_t> keyframeRequestsPrimed_{0};
+	std::atomic<bool> loggedFirstKeyframeRequest_{false};
+	std::unique_ptr<BitrateController> bitrateController_;
+	bool adaptiveBitrateEnabled_ = false;
+	int originalEncoderBitrate_ = 0;
+	int currentEncoderBitrate_ = 0;
+	int pendingPacerBitrate_ = 0;
+	int64_t pendingPacerBitrateDueMs_ = 0;
+	std::mutex h264ProfileMutex_;
+	std::string h264ProfileLevelId_;
+
+	// OBS can provide multiple encoded audio tracks. VDO.Ninja publish uses one
+	// Opus stream, so we forward exactly one selected track index.
+	size_t selectedAudioTrackIdx_ = 0;
+	std::atomic<uint64_t> droppedAudioPacketsOtherTracks_{0};
+};
+
+// OBS output info registration
+extern obs_output_info vdoninja_output_info;
+
+} // namespace vdoninja

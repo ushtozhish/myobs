@@ -1,0 +1,209 @@
+diff -ruN a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt	2026-11-12 04:28:10.006193742 +0500
++++ b/CMakeLists.txt	2026-11-12 04:28:10.007220232 +0500
+@@ -360,7 +360,10 @@
+ 		target_link_libraries(datachannel-static PRIVATE Nettle::Nettle)
+ 	endif()
+ elseif(USE_MBEDTLS)
+-	find_package(MbedTLS 3 REQUIRED)
++	# obs-vdoninja may provide a private MbedTLS::MbedTLS target before this point.
++	if(NOT TARGET MbedTLS::MbedTLS)
++		find_package(MbedTLS 3 REQUIRED)
++	endif()
+ 	target_compile_definitions(datachannel PRIVATE USE_MBEDTLS=1)
+ 	target_compile_definitions(datachannel-static PRIVATE USE_MBEDTLS=1)
+ 	target_link_libraries(datachannel PRIVATE MbedTLS::MbedTLS)
+@@ -419,10 +422,12 @@
+ endif()
+ 
+ set_target_properties(datachannel PROPERTIES EXPORT_NAME LibDataChannel)
+-add_library(LibDataChannel::LibDataChannel ALIAS datachannel)
++# Unique alias names: OBS also imports LibDataChannel::LibDataChannel from obs-deps,
++# and a global alias with that name would hijack obs-webrtc.
++add_library(VdoNinjaDataChannel::Shared ALIAS datachannel)
+ 
+ set_target_properties(datachannel-static PROPERTIES EXPORT_NAME LibDataChannelStatic)
+-add_library(LibDataChannel::LibDataChannelStatic ALIAS datachannel-static)
++add_library(VdoNinjaDataChannel::Static ALIAS datachannel-static)
+ 
+ if(NOT MSVC)
+ 	target_compile_options(datachannel PRIVATE -Wall -Wextra)
+diff -ruN a/src/impl/dtlstransport.cpp b/src/impl/dtlstransport.cpp
+--- a/src/impl/dtlstransport.cpp	2026-11-12 04:28:09.988633148 +0500
++++ b/src/impl/dtlstransport.cpp	2026-11-12 04:28:09.989920330 +0500
+@@ -542,7 +542,14 @@
+ 				}
+ 
+ 				if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
+-					ThreadPool::Instance().schedule(mTimerSetAt + milliseconds(mFinMs),
++					// MyOBS: with no retransmission timer armed (mFinMs == 0) the original
++					// deadline lies in the past, which re-runs doRecv() immediately and spins
++					// a thread-pool worker (libdatachannel issue #1597). Incoming datagrams
++					// trigger doRecv() anyway; poll at the Mbed TLS minimum timeout instead.
++					const auto deadline = mFinMs ? mTimerSetAt + milliseconds(mFinMs)
++					                             : std::chrono::steady_clock::now() +
++					                                   milliseconds(MBEDTLS_SSL_DTLS_TIMEOUT_DFL_MIN);
++					ThreadPool::Instance().schedule(deadline,
+ 					                                [weak_this = weak_from_this()]() {
+ 						                                if (auto locked = weak_this.lock())
+ 							                                locked->doRecv();
+@@ -659,7 +666,10 @@
+ 
+ 			auto bufMin = std::min(len, size_t(message->size()));
+ 			std::memcpy(buf, message->data(), bufMin);
+-			return int(len);
++			// MyOBS: report the bytes actually copied (one datagram). Returning the
++			// buffer size made Mbed TLS parse trailing garbage as further records,
++			// which fails the browser's fragmented ClientHello with Mbed TLS >= 3.6.6.
++			return int(bufMin);
+ 		}
+ 
+ 		// Closed
+diff -ruN a/src/impl/icetransport.cpp b/src/impl/icetransport.cpp
+--- a/src/impl/icetransport.cpp	2026-11-12 04:28:09.970578303 +0500
++++ b/src/impl/icetransport.cpp	2026-11-12 04:28:09.971824934 +0500
+@@ -89,6 +89,7 @@
+ 	jconfig.cb_gathering_done = IceTransport::GatheringDoneCallback;
+ 	jconfig.cb_recv = IceTransport::RecvCallback;
+ 	jconfig.user_ptr = this;
++	jconfig.relay_only = config.iceTransportPolicy == TransportPolicy::Relay; // VDONINJA_RELAY_POLICY
+ 
+ 	if (config.enableIceTcp) {
+ 		PLOG_WARNING << "ICE-TCP is not supported with libjuice";
+diff -ruN a/src/impl/pollservice.cpp b/src/impl/pollservice.cpp
+--- a/src/impl/pollservice.cpp	2026-11-12 04:28:09.974619937 +0500
++++ b/src/impl/pollservice.cpp	2026-11-12 04:28:09.977898431 +0500
+@@ -105,6 +105,8 @@
+ }
+ 
+ void PollService::process(std::vector<struct pollfd> &pfds) {
++	using Callback = decltype(std::declval<Params>().callback);
++	std::vector<std::pair<Callback, Event>> todo;
+ 	std::unique_lock lock(mMutex);
+ 	auto it = pfds.begin();
+ 	if (it != pfds.end()) {
+@@ -124,7 +126,7 @@
+ 					PLOG_VERBOSE << "Poll error event";
+ 					auto callback = std::move(params.callback);
+ 					mSocks->erase(sock);
+-					callback(Event::Error);
++					todo.emplace_back(std::move(callback), Event::Error);
+ 
+ 				} else if (it->revents & POLLIN || it->revents & POLLOUT || it->revents & POLLHUP) {
+ 					entry.until = params.timeout
+@@ -135,18 +137,18 @@
+ 					if (it->revents & POLLIN ||
+ 					    it->revents & POLLHUP) { // Windows does not set POLLIN on close
+ 						PLOG_VERBOSE << "Poll in event";
+-						callback(Event::In);
++						todo.emplace_back(callback, Event::In);
+ 					}
+ 					if (it->revents & POLLOUT) {
+ 						PLOG_VERBOSE << "Poll out event";
+-						callback(Event::Out);
++						todo.emplace_back(callback, Event::Out);
+ 					}
+ 
+ 				} else if (entry.until && clock::now() >= *entry.until) {
+ 					PLOG_VERBOSE << "Poll timeout event";
+ 					auto callback = std::move(params.callback);
+ 					mSocks->erase(sock);
+-					callback(Event::Timeout);
++					todo.emplace_back(std::move(callback), Event::Timeout);
+ 				}
+ 
+ 			} catch (const std::exception &e) {
+@@ -157,6 +159,11 @@
+ 
+ 		++it;
+ 	}
++	lock.unlock();
++
++	// VDONINJA_POLL_CALLBACKS: never hold the poll mutex while taking a transport lock.
++	for (auto &[callback, event] : todo)
++		callback(event);
+ }
+ 
+ void PollService::runLoop() {
+diff -ruN a/src/impl/tcptransport.cpp b/src/impl/tcptransport.cpp
+--- a/src/impl/tcptransport.cpp	2026-11-12 04:28:09.982618358 +0500
++++ b/src/impl/tcptransport.cpp	2026-11-12 04:28:09.983711349 +0500
+@@ -427,6 +427,7 @@
+ 		}
+ 
+ 		case PollService::Event::Out: {
++			std::lock_guard lock(mSendMutex);
+ 			if (trySendQueue())
+ 				setPoll(PollService::Direction::In);
+ 
+diff -ruN a/src/impl/tlstransport.cpp b/src/impl/tlstransport.cpp
+--- a/src/impl/tlstransport.cpp	2026-11-12 04:28:09.994622353 +0500
++++ b/src/impl/tlstransport.cpp	2026-11-12 04:28:09.995648653 +0500
+@@ -7,6 +7,8 @@
+  */
+ 
+ #include "tlstransport.hpp"
++
++#include <utility>
+ #include "httpproxytransport.hpp"
+ #include "tcptransport.hpp"
+ #include "threadpool.hpp"
+@@ -444,10 +446,14 @@
+ 		if (state() == State::Connecting) {
+ 			while (true) {
+ 				int ret;
++				message_ptr deferred;
+ 				{
+ 					std::lock_guard lock(mSslMutex);
+ 					ret = mbedtls_ssl_handshake(&mSsl);
++					deferred = std::exchange(mDeferredZeroSized, nullptr);
+ 				}
++				if (deferred)
++					recv(deferred); // Pass zero-sized messages through
+ 
+ 				if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
+ 					return;
+@@ -465,11 +471,15 @@
+ 		if (state() == State::Connected) {
+ 			while (true) {
+ 				int ret;
++				message_ptr deferred;
+ 				{
+ 					std::lock_guard lock(mSslMutex);
+ 					ret = mbedtls_ssl_read(&mSsl, reinterpret_cast<unsigned char *>(buffer),
+ 					                       bufferSize);
++					deferred = std::exchange(mDeferredZeroSized, nullptr);
+ 				}
++				if (deferred)
++					recv(deferred); // Pass zero-sized messages through
+ 
+ 				if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
+ 					return;
+@@ -527,8 +537,11 @@
+ 				message = *next;
+ 				if (message->size() > 0)
+ 					break;
+-				else
+-					t->recv(message); // Pass zero-sized messages through
++				// Zero-sized (idle) message: hand it to doRecv(), which delivers it outside
++				// mSslMutex. Do not keep it as the current message, otherwise this callback
++				// returns 0, which Mbed TLS reads as end of connection.
++				t->mDeferredZeroSized = message;
++				message.reset();
+ 			}
+ 		}
+ 
+diff -ruN a/src/impl/tlstransport.hpp b/src/impl/tlstransport.hpp
+--- a/src/impl/tlstransport.hpp	2026-11-12 04:28:10.000227371 +0500
++++ b/src/impl/tlstransport.hpp	2026-11-12 04:28:10.001254032 +0500
+@@ -77,6 +77,10 @@
+ 
+ 	message_ptr mIncomingMessage;
+ 	size_t mIncomingMessagePosition = 0;
++	// MyOBS: zero-sized (idle) messages seen by ReadCallback while mSslMutex is
++	// held. doRecv() delivers them after unlocking, because the WebSocket layer
++	// answers an idle notification by sending a ping, which locks mSslMutex.
++	message_ptr mDeferredZeroSized;
+ 
+ 	static int WriteCallback(void *ctx, const unsigned char *buf, size_t len);
+ 	static int ReadCallback(void *ctx, unsigned char *buf, size_t len);

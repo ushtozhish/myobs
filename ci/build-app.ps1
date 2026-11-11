@@ -19,8 +19,30 @@ if (-not (Test-Path (Join-Path $ndi 'lib/ndi/Processing.NDI.Lib.h'))) {
     git -C $ndi checkout -q FETCH_HEAD
 }
 $ndiInclude = (Join-Path $ndi 'lib/ndi').Replace('\', '/')
+# Calls (obs-vdoninja): libdatachannel v0.20.2 with the MyOBS patch and the official Mbed TLS 3.6.7.
+$ldc = Join-Path $root 'engine-build/libdatachannel-0.20.2'
+if (-not (Test-Path (Join-Path $ldc '.myobs-patched'))) {
+    if (Test-Path $ldc) { Remove-Item $ldc -Recurse -Force }
+    git -c core.autocrlf=false clone -q --depth 1 --branch v0.20.2 --recurse-submodules --shallow-submodules https://github.com/paullouisageneau/libdatachannel.git $ldc
+    if ($LASTEXITCODE) { throw 'libdatachannel clone failed' }
+    git -C $ldc apply --ignore-whitespace --whitespace=nowarn (Join-Path $root 'third_party/patches/libdatachannel-0.20.2-myobs.patch')
+    if ($LASTEXITCODE) { throw 'libdatachannel patch failed' }
+    New-Item -ItemType File (Join-Path $ldc '.myobs-patched') | Out-Null
+}
+$mbed = Join-Path $root 'engine-build/mbedtls-3.6.7'
+if (-not (Test-Path (Join-Path $mbed 'CMakeLists.txt'))) {
+    $tarball = Join-Path $root 'engine-build/mbedtls-3.6.7.tar.bz2'
+    Invoke-WebRequest -Uri 'https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.7/mbedtls-3.6.7.tar.bz2' -OutFile $tarball
+    $hash = (Get-FileHash $tarball -Algorithm SHA256).Hash.ToLower()
+    if ($hash -ne 'a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6') { throw "mbedtls archive hash mismatch: $hash" }
+    tar -xjf $tarball -C (Join-Path $root 'engine-build')
+    if ($LASTEXITCODE) { throw 'mbedtls extract failed' }
+}
+$ldcArg = $ldc.Replace('\', '/')
+$mbedArg = $mbed.Replace('\', '/')
 
-cmake -S $root -B (Join-Path $root 'build') -G 'Visual Studio 18 2026' -A x64 "-DCMAKE_PREFIX_PATH=$prefixArg" "-DMYOBS_NDI_SDK_DIR=$ndiInclude"
+
+cmake -S $root -B (Join-Path $root 'build') -G 'Visual Studio 18 2026' -A x64 "-DCMAKE_PREFIX_PATH=$prefixArg" "-DMYOBS_NDI_SDK_DIR=$ndiInclude" "-DMYOBS_LIBDATACHANNEL_DIR=$ldcArg" "-DMYOBS_MBEDTLS_DIR=$mbedArg"
 if ($LASTEXITCODE) { throw 'configure failed' }
 cmake --build (Join-Path $root 'build') --config RelWithDebInfo --parallel
 if ($LASTEXITCODE) { throw 'build failed' }

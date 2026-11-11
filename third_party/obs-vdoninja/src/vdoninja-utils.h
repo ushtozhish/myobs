@@ -1,0 +1,193 @@
+/*
+ * OBS VDO.Ninja Plugin
+ * Utility functions for hashing, JSON handling, and string manipulation
+ */
+
+#pragma once
+
+#include <array>
+#include <chrono>
+#include <map>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "vdoninja-common.h"
+
+namespace vdoninja
+{
+
+struct AspectFitLayout {
+	uint32_t outputWidth = 0;
+	uint32_t outputHeight = 0;
+	uint32_t contentWidth = 0;
+	uint32_t contentHeight = 0;
+	uint32_t offsetX = 0;
+	uint32_t offsetY = 0;
+};
+
+struct SdpOfferedCodec {
+	int payloadType = -1;
+	std::string codec;
+	int clockRate = 0;
+	int channels = 0;
+	std::string formatParameters;
+	int associatedPayloadType = -1;
+};
+
+struct SdpOfferedMediaSection {
+	std::string type;
+	std::string mid;
+	int port = -1;
+	// JSEP max-bundle offers use port 0 plus a=bundle-only for every section after the first.
+	bool bundleOnly = false;
+	std::string direction = "sendrecv";
+	std::vector<int> payloadTypes;
+	std::vector<SdpOfferedCodec> codecs;
+	struct HeaderExtension {
+		int id;
+		std::string direction;
+		std::string uri;
+	};
+	std::vector<HeaderExtension> headerExtensions;
+};
+
+// UUID generation
+std::string generateUUID();
+
+// Session ID generation (8 characters)
+std::string generateSessionId();
+
+// SHA-256 based hashing for stream/room IDs (matching VDO.Ninja SDK)
+std::string sha256(const std::string &input);
+bool isPasswordDisabledToken(const std::string &password);
+std::string hashStreamId(const std::string &streamId, const std::string &password, const std::string &salt);
+std::string hashRoomId(const std::string &roomId, const std::string &password, const std::string &salt);
+std::string deriveViewStreamId(const std::string &streamId, const std::string &password, const std::string &salt);
+std::string buildSignalingUrlParameter(const std::string &wssHost);
+std::string buildViewerPageUrl(const std::string &baseUrl, const std::string &streamId, const std::string &password,
+                               const std::string &roomId, const std::string &salt, const std::string &wssHost = "");
+std::string buildInboundViewUrl(const std::string &baseUrl, const std::string &streamId, const std::string &password,
+                                const std::string &roomId, const std::string &salt, const std::string &wssHost = "");
+int chooseViewerTargetBitrateKbps(uint32_t width, uint32_t height);
+uint32_t normalizeSourceDimension(int64_t value, uint32_t fallback, uint32_t minValue, uint32_t maxValue);
+int normalizeOpusSampleRate(int sampleRate);
+int normalizeOpusChannelCount(int channels);
+// Six discrete output slots, in SDP order (no implied Vorbis speaker reorder).
+struct MultiOpusConfig {
+	uint8_t streams = 0;
+	uint8_t coupledStreams = 0;
+	std::array<uint8_t, 6> mapping{};
+};
+std::optional<MultiOpusConfig> parseSixChannelMultiOpus(int rate, int channels, const std::string &parameters);
+std::vector<uint8_t> multiOpusHeader(const MultiOpusConfig &config);
+std::string buildViewerRequestMessage(uint32_t width, uint32_t height, bool guest,
+                                      const std::string &viewerInfoJson = "");
+std::vector<std::string> buildIncomingSignalingPasswordCandidates(const std::string &messageStreamId,
+                                                                  const std::string &defaultPassword,
+                                                                  const StreamInfo &publishedStream,
+                                                                  const std::vector<StreamInfo> &viewingStreams,
+                                                                  const RoomInfo &currentRoom);
+
+// Sanitize stream ID (replace non-alphanumeric with underscores)
+std::string sanitizeStreamId(const std::string &streamId);
+
+// Simple JSON utilities (avoiding external JSON library dependency)
+class JsonBuilder
+{
+public:
+	JsonBuilder &add(const std::string &key, const std::string &value);
+	JsonBuilder &add(const std::string &key, const char *value);
+	JsonBuilder &add(const std::string &key, int value);
+	JsonBuilder &add(const std::string &key, int64_t value);
+	JsonBuilder &add(const std::string &key, bool value);
+	JsonBuilder &addRaw(const std::string &key, const std::string &rawJson);
+	std::string build() const;
+
+private:
+	std::vector<std::pair<std::string, std::string>> entries_;
+};
+
+class JsonParser
+{
+public:
+	explicit JsonParser(const std::string &json);
+
+	bool hasKey(const std::string &key) const;
+	std::string getString(const std::string &key, const std::string &defaultValue = "") const;
+	int getInt(const std::string &key, int defaultValue = 0) const;
+	bool getBool(const std::string &key, bool defaultValue = false) const;
+	std::string getRaw(const std::string &key) const;
+
+	// Get nested object as raw JSON
+	std::string getObject(const std::string &key) const;
+
+	// Get array elements
+	std::vector<std::string> getArray(const std::string &key) const;
+
+private:
+	std::string json_;
+	std::map<std::string, std::string> values_;
+	void parse();
+	std::string extractValue(size_t &pos) const;
+};
+
+// String utilities
+std::string base64Encode(const std::vector<uint8_t> &data);
+std::vector<uint8_t> base64Decode(const std::string &encoded);
+std::string urlEncode(const std::string &value);
+std::string jsEncodeURIComponent(const std::string &value);
+std::string trim(const std::string &str);
+std::vector<std::string> split(const std::string &str, char delimiter);
+std::vector<IceServer> parseIceServers(const std::string &config);
+bool countsTowardViewerLimit(ConnectionState state);
+AspectFitLayout computeAspectFitLayout(uint32_t sourceWidth, uint32_t sourceHeight, uint32_t outputWidth,
+                                       uint32_t outputHeight);
+
+enum class SignalingConnectErrorCategory {
+	Unknown,
+	Tcp,
+	Tls,
+	WebSocketHandshake,
+};
+
+SignalingConnectErrorCategory classifySignalingConnectError(const std::string &error);
+const char *signalingConnectErrorCategoryName(SignalingConnectErrorCategory category);
+const char *signalingConnectErrorLikelyCauses(SignalingConnectErrorCategory category);
+
+// Filename of the CA-certificate bundle shipped with the plugin so that a
+// self-contained OpenSSL build can verify TLS peers on machines that do not
+// provide their own trust store (e.g. macOS without Homebrew). The macOS
+// installer copies the bundle into the .plugin bundle's Contents/Resources/data
+// under this exact name — it deliberately does NOT sit next to the binary in
+// Contents/MacOS, because codesign rejects unsigned non-code files there.
+inline constexpr const char *kBundledCaCertificateFileName = "vdoninja-ca-bundle.pem";
+
+// Builds an ordered list of candidate CA-bundle file paths to try for TLS
+// verification. Precedence: an explicit SSL_CERT_FILE override, then a bundle
+// shipped alongside the plugin module (checked in each provided module
+// directory), then well-known system locations. The caller probes the returned
+// paths in order and uses the first that exists. Duplicate paths are collapsed.
+std::vector<std::string> buildCaCertificateCandidatePaths(const std::string &sslCertFileEnv,
+                                                          const std::vector<std::string> &moduleDirs);
+
+// Time utilities
+int64_t currentTimeMs();
+std::string formatTimestamp(int64_t ms);
+
+// SDP manipulation utilities
+std::string modifySdpForCodec(const std::string &sdp, VideoCodec codec);
+std::string modifySdpBitrate(const std::string &sdp, int bitrate);
+std::string extractMid(const std::string &sdp, const std::string &mediaType);
+std::string stripUnsupportedTransportCcFeedback(const std::string &sdp);
+std::vector<SdpOfferedMediaSection> parseOfferedMediaSections(const std::string &sdp);
+bool offeredMediaSectionCanSend(const SdpOfferedMediaSection &section);
+bool offerHasActiveVp9AlphaSection(const std::vector<SdpOfferedMediaSection> &sections);
+
+// Logging helpers
+void logInfo(const char *format, ...);
+void logWarning(const char *format, ...);
+void logError(const char *format, ...);
+void logDebug(const char *format, ...);
+
+} // namespace vdoninja

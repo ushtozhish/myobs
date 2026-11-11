@@ -1,0 +1,1913 @@
+/*
+ * OBS VDO.Ninja Plugin
+ * Utility function implementations
+ */
+
+#include "vdoninja-utils.h"
+
+#include <obs-module.h>
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cmath>
+#include <cstdarg>
+#include <cstdint>
+#include <iomanip>
+#include <locale>
+#include <random>
+#include <regex>
+#include <sstream>
+
+namespace vdoninja
+{
+
+namespace
+{
+
+inline uint32_t rotr32(uint32_t value, uint32_t bits)
+{
+	return (value >> bits) | (value << (32 - bits));
+}
+
+const std::array<uint32_t, 64> SHA256_K = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+
+bool isAsciiAlphanumeric(char c)
+{
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+}
+
+std::string sanitizeIdentifier(const std::string &value, size_t maxLength)
+{
+	std::string result;
+	result.reserve(value.size());
+
+	// Match SDK behavior: trim whitespace, keep case, replace each run of non-word chars with '_'.
+	std::string trimmed = trim(value);
+	bool inInvalidRun = false;
+	for (char c : trimmed) {
+		if (isAsciiAlphanumeric(c) || c == '_') {
+			result += c;
+			inInvalidRun = false;
+		} else {
+			if (!inInvalidRun) {
+				result += '_';
+				inInvalidRun = true;
+			}
+		}
+	}
+
+	if (result.size() > maxLength) {
+		result.resize(maxLength);
+	}
+
+	return result;
+}
+
+bool startsWithInsensitive(const std::string &value, const char *prefix)
+{
+	size_t idx = 0;
+	for (; prefix[idx] != '\0'; ++idx) {
+		if (idx >= value.size()) {
+			return false;
+		}
+		const char a = static_cast<char>(std::tolower(static_cast<unsigned char>(value[idx])));
+		const char b = static_cast<char>(std::tolower(static_cast<unsigned char>(prefix[idx])));
+		if (a != b) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool isIceUrl(const std::string &url)
+{
+	return startsWithInsensitive(url, "stun:") || startsWithInsensitive(url, "stuns:") ||
+	       startsWithInsensitive(url, "turn:") || startsWithInsensitive(url, "turns:");
+}
+
+bool isSupportedIceUrl(const std::string &url)
+{
+	return startsWithInsensitive(url, "stun:") || startsWithInsensitive(url, "turn:") ||
+	       startsWithInsensitive(url, "turns:");
+}
+
+std::string stripUrlDelimiters(const std::string &value)
+{
+	size_t end = value.find_first_of("/?#");
+	return end == std::string::npos ? value : value.substr(0, end);
+}
+
+bool hasValidIceUrlShape(const std::string &url)
+{
+	if (!isSupportedIceUrl(url)) {
+		return false;
+	}
+
+	size_t schemeEnd = url.find(':');
+	if (schemeEnd == std::string::npos || schemeEnd + 1 >= url.size()) {
+		return false;
+	}
+
+	std::string authority = url.substr(schemeEnd + 1);
+	if (authority.rfind("//", 0) == 0) {
+		authority.erase(0, 2);
+	}
+
+	const size_t atPos = authority.rfind('@');
+	if (atPos != std::string::npos) {
+		authority.erase(0, atPos + 1);
+	}
+	authority = stripUrlDelimiters(authority);
+
+	if (authority.empty()) {
+		return false;
+	}
+
+	std::string port;
+	bool portSpecified = false;
+	if (authority.front() == '[') {
+		const size_t bracketEnd = authority.find(']');
+		if (bracketEnd == std::string::npos || bracketEnd == 1) {
+			return false;
+		}
+		if (bracketEnd + 1 < authority.size()) {
+			if (authority[bracketEnd + 1] != ':') {
+				return false;
+			}
+			portSpecified = true;
+			port = authority.substr(bracketEnd + 2);
+		}
+	} else {
+		const size_t lastColon = authority.rfind(':');
+		if (lastColon == 0) {
+			return false;
+		}
+		if (lastColon != std::string::npos) {
+			const bool hasOnlyOneColon = authority.find(':') == lastColon;
+			if (hasOnlyOneColon) {
+				portSpecified = true;
+				port = authority.substr(lastColon + 1);
+			}
+		}
+	}
+
+	if (port.empty()) {
+		return !portSpecified;
+	}
+
+	if (!std::all_of(port.begin(), port.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
+		return false;
+	}
+
+	try {
+		const unsigned long parsedPort = std::stoul(port);
+		return parsedPort > 0 && parsedPort <= 65535;
+	} catch (...) {
+		return false;
+	}
+}
+
+bool isDirectPlaybackUrl(const std::string &value)
+{
+	return startsWithInsensitive(value, "http://") || startsWithInsensitive(value, "https://");
+}
+
+std::string asciiLowerCopy(std::string value)
+{
+	for (char &c : value) {
+		c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	}
+	return value;
+}
+
+std::vector<std::string> splitWhitespace(const std::string &value)
+{
+	std::vector<std::string> tokens;
+	std::istringstream input(value);
+	std::string token;
+	while (input >> token) {
+		tokens.push_back(token);
+	}
+	return tokens;
+}
+
+int parseIntOrDefault(const std::string &value, int defaultValue = -1)
+{
+	try {
+		return std::stoi(value);
+	} catch (...) {
+		return defaultValue;
+	}
+}
+
+bool containsPayloadType(const std::vector<int> &payloadTypes, int payloadType)
+{
+	return std::find(payloadTypes.begin(), payloadTypes.end(), payloadType) != payloadTypes.end();
+}
+
+SdpOfferedCodec *findCodecByPayloadType(std::vector<SdpOfferedCodec> &codecs, int payloadType)
+{
+	for (auto &codec : codecs) {
+		if (codec.payloadType == payloadType) {
+			return &codec;
+		}
+	}
+	return nullptr;
+}
+
+bool containsInsensitive(const std::string &value, const char *needle)
+{
+	return asciiLowerCopy(value).find(asciiLowerCopy(needle)) != std::string::npos;
+}
+
+std::string normalizeInboundPlaybackTarget(const std::string &value)
+{
+	if (startsWithInsensitive(value, "whep://")) {
+		return "https://" + value.substr(7);
+	}
+
+	if (startsWithInsensitive(value, "wheps://")) {
+		return "https://" + value.substr(8);
+	}
+
+	if (!startsWithInsensitive(value, "whep:")) {
+		return value;
+	}
+
+	return trim(value.substr(5));
+}
+
+bool hasVdoBrowserPlaybackParam(const std::string &candidate)
+{
+	// VDO.Ninja intentionally merges fragment parameters into its query parameters.
+	const std::string lowered = asciiLowerCopy(candidate);
+	for (const char *parameter : {"view=", "v=", "streamid=", "pull=", "whep=", "whepplay="}) {
+		for (const char delimiter : {'?', '&', '#'}) {
+			if (lowered.find(std::string(1, delimiter) + parameter) != std::string::npos) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool isBrowserSourceViewerUrl(const std::string &candidate, const std::string &baseUrl)
+{
+	if (!isDirectPlaybackUrl(candidate)) {
+		return false;
+	}
+
+	const std::string normalizedBaseUrl = trim(baseUrl);
+	if (!normalizedBaseUrl.empty() && startsWithInsensitive(candidate, normalizedBaseUrl.c_str()) &&
+	    hasVdoBrowserPlaybackParam(candidate)) {
+		return true;
+	}
+
+	return (containsInsensitive(candidate, "://vdo.ninja") || containsInsensitive(candidate, "://obs.ninja")) &&
+	       hasVdoBrowserPlaybackParam(candidate);
+}
+
+std::string normalizeBaseBrowserUrl(const std::string &baseUrl)
+{
+	std::string normalized = trim(baseUrl);
+	if (normalized.empty()) {
+		normalized = "https://vdo.ninja";
+	}
+
+	while (!normalized.empty() && normalized.back() == '/') {
+		normalized.pop_back();
+	}
+
+	return normalized.empty() ? "https://vdo.ninja" : normalized;
+}
+
+} // namespace
+
+// UUID Generation
+std::string generateUUID()
+{
+	thread_local std::random_device rd;
+	thread_local std::mt19937 gen(rd());
+	thread_local std::uniform_int_distribution<> dis(0, 15);
+	thread_local std::uniform_int_distribution<> dis2(8, 11);
+
+	std::stringstream ss;
+	ss << std::hex;
+
+	for (int i = 0; i < 8; i++)
+		ss << dis(gen);
+	ss << "-";
+	for (int i = 0; i < 4; i++)
+		ss << dis(gen);
+	ss << "-4"; // Version 4
+	for (int i = 0; i < 3; i++)
+		ss << dis(gen);
+	ss << "-";
+	ss << dis2(gen); // Variant
+	for (int i = 0; i < 3; i++)
+		ss << dis(gen);
+	ss << "-";
+	for (int i = 0; i < 12; i++)
+		ss << dis(gen);
+
+	return ss.str();
+}
+
+std::string generateSessionId()
+{
+	static const char alphanum[] = "0123456789"
+	                               "abcdefghijklmnopqrstuvwxyz";
+	thread_local std::random_device rd;
+	thread_local std::mt19937 gen(rd());
+	thread_local std::uniform_int_distribution<> dis(0, sizeof(alphanum) - 2);
+
+	std::string result;
+	result.reserve(8);
+	for (int i = 0; i < 8; i++) {
+		result += alphanum[dis(gen)];
+	}
+	return result;
+}
+
+// SHA-256 hashing
+std::string sha256(const std::string &input)
+{
+	std::vector<uint8_t> data(input.begin(), input.end());
+	const uint64_t originalBitLen = static_cast<uint64_t>(data.size()) * 8ULL;
+
+	data.push_back(0x80);
+	while ((data.size() % 64) != 56) {
+		data.push_back(0x00);
+	}
+
+	for (int shift = 56; shift >= 0; shift -= 8) {
+		data.push_back(static_cast<uint8_t>((originalBitLen >> shift) & 0xff));
+	}
+
+	uint32_t h0 = 0x6a09e667;
+	uint32_t h1 = 0xbb67ae85;
+	uint32_t h2 = 0x3c6ef372;
+	uint32_t h3 = 0xa54ff53a;
+	uint32_t h4 = 0x510e527f;
+	uint32_t h5 = 0x9b05688c;
+	uint32_t h6 = 0x1f83d9ab;
+	uint32_t h7 = 0x5be0cd19;
+
+	for (size_t chunk = 0; chunk < data.size(); chunk += 64) {
+		uint32_t w[64] = {};
+		for (int i = 0; i < 16; ++i) {
+			const size_t idx = chunk + static_cast<size_t>(i) * 4;
+			w[i] = (static_cast<uint32_t>(data[idx]) << 24) | (static_cast<uint32_t>(data[idx + 1]) << 16) |
+			       (static_cast<uint32_t>(data[idx + 2]) << 8) | (static_cast<uint32_t>(data[idx + 3]));
+		}
+
+		for (int i = 16; i < 64; ++i) {
+			const uint32_t s0 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >> 3);
+			const uint32_t s1 = rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^ (w[i - 2] >> 10);
+			w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+		}
+
+		uint32_t a = h0;
+		uint32_t b = h1;
+		uint32_t c = h2;
+		uint32_t d = h3;
+		uint32_t e = h4;
+		uint32_t f = h5;
+		uint32_t g = h6;
+		uint32_t h = h7;
+
+		for (int i = 0; i < 64; ++i) {
+			const uint32_t s1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
+			const uint32_t ch = (e & f) ^ ((~e) & g);
+			const uint32_t temp1 = h + s1 + ch + SHA256_K[i] + w[i];
+			const uint32_t s0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
+			const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+			const uint32_t temp2 = s0 + maj;
+
+			h = g;
+			g = f;
+			f = e;
+			e = d + temp1;
+			d = c;
+			c = b;
+			b = a;
+			a = temp1 + temp2;
+		}
+
+		h0 += a;
+		h1 += b;
+		h2 += c;
+		h3 += d;
+		h4 += e;
+		h5 += f;
+		h6 += g;
+		h7 += h;
+	}
+
+	std::stringstream ss;
+	ss.imbue(std::locale::classic()); // Hash text must not inherit localized digit grouping.
+	ss << std::hex << std::setfill('0') << std::nouppercase;
+	ss << std::setw(8) << h0 << std::setw(8) << h1 << std::setw(8) << h2 << std::setw(8) << h3 << std::setw(8) << h4
+	   << std::setw(8) << h5 << std::setw(8) << h6 << std::setw(8) << h7;
+	return ss.str();
+}
+
+bool isPasswordDisabledToken(const std::string &password)
+{
+	if (password.empty()) {
+		return false;
+	}
+
+	std::string normalized = trim(password);
+	if (normalized.empty()) {
+		return false;
+	}
+
+	std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+	               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	return normalized == "false" || normalized == "0" || normalized == "off" || normalized == "no";
+}
+
+// Hash stream ID matching VDO.Ninja SDK algorithm
+std::string hashStreamId(const std::string &streamId, const std::string &password, const std::string &salt)
+{
+	std::string sanitized = sanitizeIdentifier(streamId, 64);
+	const std::string normalizedPassword = trim(password);
+
+	// If no password, just return sanitized stream ID
+	if (normalizedPassword.empty() || isPasswordDisabledToken(normalizedPassword)) {
+		return sanitized;
+	}
+
+	// VDO.Ninja's JS runs encodeURIComponent() on the password before hashing
+	// (sanitizePassword in lib.js). We must do the same to produce matching hashes.
+	std::string encodedPassword = jsEncodeURIComponent(normalizedPassword);
+	std::string passwordHash = sha256(encodedPassword + salt).substr(0, 6);
+	return sanitized + passwordHash;
+}
+
+std::string hashRoomId(const std::string &roomId, const std::string &password, const std::string &salt)
+{
+	std::string sanitized = sanitizeIdentifier(roomId, 30);
+	const std::string normalizedPassword = trim(password);
+
+	if (normalizedPassword.empty() || isPasswordDisabledToken(normalizedPassword)) {
+		return sanitized;
+	}
+
+	// VDO.Ninja's JS runs encodeURIComponent() on the password before hashing
+	std::string encodedPassword = jsEncodeURIComponent(normalizedPassword);
+	std::string combined = sanitized + encodedPassword + salt;
+	std::string fullHash = sha256(combined);
+	return fullHash.substr(0, 16);
+}
+
+std::string deriveViewStreamId(const std::string &streamId, const std::string &password, const std::string &salt)
+{
+	std::string viewId = streamId;
+	if (viewId.size() <= 6) {
+		return viewId;
+	}
+
+	const std::string normalizedPassword = trim(password);
+	const bool passwordDisabled = isPasswordDisabledToken(normalizedPassword);
+
+	std::vector<std::string> suffixes;
+	if (!normalizedPassword.empty() && !passwordDisabled) {
+		suffixes.push_back(sha256(jsEncodeURIComponent(normalizedPassword) + salt).substr(0, 6));
+	}
+	suffixes.push_back(sha256(jsEncodeURIComponent(std::string(DEFAULT_PASSWORD)) + salt).substr(0, 6));
+
+	for (const auto &suffix : suffixes) {
+		if (!suffix.empty() && viewId.size() > suffix.size() &&
+		    viewId.compare(viewId.size() - suffix.size(), suffix.size(), suffix) == 0) {
+			viewId.resize(viewId.size() - suffix.size());
+			break;
+		}
+	}
+
+	return viewId;
+}
+
+std::string buildSignalingUrlParameter(const std::string &wssHost)
+{
+	const std::string host = trim(wssHost);
+	std::string normalized = host;
+	std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+	               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	if (!normalized.empty() && normalized.back() == '/')
+		normalized.pop_back();
+	if (host.empty() || normalized == DEFAULT_WSS_HOST || normalized == std::string(DEFAULT_WSS_HOST) + ":443")
+		return "";
+
+	// wss selects the browser's custom-server protocol. wss2 overrides the
+	// endpoint while retaining the native VDO.Ninja protocol and encryption.
+	return "&wss2=" + urlEncode(host);
+}
+
+std::string buildViewerPageUrl(const std::string &baseUrl, const std::string &streamId, const std::string &password,
+                               const std::string &roomId, const std::string &salt, const std::string &wssHost)
+{
+	const std::string normalizedStreamId = trim(streamId);
+	if (normalizedStreamId.empty()) {
+		return "";
+	}
+
+	const std::string normalizedBaseUrl = normalizeBaseBrowserUrl(baseUrl);
+	const std::string normalizedPassword = trim(password);
+	const bool passwordDisabled = isPasswordDisabledToken(normalizedPassword);
+	const std::string viewId = deriveViewStreamId(normalizedStreamId, normalizedPassword, salt);
+
+	std::string url = normalizedBaseUrl + "/?view=" + urlEncode(viewId);
+	if (!roomId.empty()) {
+		url += "&room=" + urlEncode(roomId);
+		url += "&solo";
+	}
+
+	if (!normalizedPassword.empty()) {
+		url += passwordDisabled ? "&password=false" : "&password=" + urlEncode(normalizedPassword);
+	}
+
+	if (!salt.empty() && salt != DEFAULT_SALT) {
+		url += "&salt=" + urlEncode(salt);
+	}
+
+	url += buildSignalingUrlParameter(wssHost);
+
+	return url;
+}
+
+std::string buildInboundViewUrl(const std::string &baseUrl, const std::string &streamId, const std::string &password,
+                                const std::string &roomId, const std::string &salt, const std::string &wssHost)
+{
+	const std::string normalizedStreamId = normalizeInboundPlaybackTarget(trim(streamId));
+	const std::string normalizedBaseUrl = normalizeBaseBrowserUrl(baseUrl);
+
+	if (normalizedStreamId.empty()) {
+		return "";
+	}
+
+	// Browser-source auto-add should only point at VDO.Ninja-style viewer pages.
+	if (isBrowserSourceViewerUrl(normalizedStreamId, normalizedBaseUrl)) {
+		return normalizedStreamId;
+	}
+
+	if (isDirectPlaybackUrl(normalizedStreamId)) {
+		return normalizedBaseUrl + "/?whepplay=" + urlEncode(normalizedStreamId);
+	}
+
+	return buildViewerPageUrl(normalizedBaseUrl, normalizedStreamId, password, roomId, salt, wssHost);
+}
+
+int chooseViewerTargetBitrateKbps(uint32_t width, uint32_t height)
+{
+	if (width >= 3840 || height >= 2160) {
+		return 25000;
+	}
+	if (width >= 2560 || height >= 1440) {
+		return 12000;
+	}
+	if (width >= 1920 || height >= 1080) {
+		return 8000;
+	}
+	if (width >= 1280 || height >= 720) {
+		return 2500;
+	}
+	if (width >= 854 || height >= 480) {
+		return 1200;
+	}
+	return 800;
+}
+
+uint32_t normalizeSourceDimension(int64_t value, uint32_t fallback, uint32_t minValue, uint32_t maxValue)
+{
+	if (minValue > maxValue) {
+		std::swap(minValue, maxValue);
+	}
+
+	const uint32_t normalizedFallback = std::clamp(fallback, minValue, maxValue);
+	if (value <= 0) {
+		return normalizedFallback;
+	}
+	if (value < static_cast<int64_t>(minValue)) {
+		return minValue;
+	}
+	if (value > static_cast<int64_t>(maxValue)) {
+		return maxValue;
+	}
+	return static_cast<uint32_t>(value);
+}
+
+int normalizeOpusSampleRate(int sampleRate)
+{
+	(void)sampleRate;
+	return 48000;
+}
+
+int normalizeOpusChannelCount(int channels)
+{
+	if (channels == 1) {
+		return 1;
+	}
+	return 2;
+}
+
+std::optional<MultiOpusConfig> parseSixChannelMultiOpus(int rate, int channels, const std::string &parameters)
+{
+	if (rate != 48000 || channels != 6) {
+		return std::nullopt;
+	}
+	std::map<std::string, std::string> values;
+	std::istringstream fields(parameters);
+	std::string field;
+	while (std::getline(fields, field, ';')) {
+		const auto separator = field.find('=');
+		if (separator == std::string::npos) {
+			continue;
+		}
+		const auto key = trim(field.substr(0, separator));
+		if (!values.emplace(key, trim(field.substr(separator + 1))).second) {
+			return std::nullopt;
+		}
+	}
+	auto number = [](const std::string &text, int &value) {
+		if (text.empty() || text.size() > 3 ||
+		    !std::all_of(text.begin(), text.end(), [](unsigned char c) { return c >= '0' && c <= '9'; })) {
+			return false;
+		}
+		value = std::stoi(text);
+		return true;
+	};
+	int streams = 0, coupled = 0;
+	if (!number(values["num_streams"], streams) || !number(values["coupled_streams"], coupled) || streams < 1 ||
+	    coupled > streams || streams + coupled > 6) {
+		return std::nullopt;
+	}
+	MultiOpusConfig result;
+	result.streams = static_cast<uint8_t>(streams);
+	result.coupledStreams = static_cast<uint8_t>(coupled);
+	std::istringstream mapping(values["channel_mapping"]);
+	for (auto &slot : result.mapping) {
+		int value = 0;
+		if (!std::getline(mapping, field, ',') || !number(trim(field), value) ||
+		    (value >= streams + coupled && value != 255)) {
+			return std::nullopt;
+		}
+		slot = static_cast<uint8_t>(value);
+	}
+	if (mapping.peek() != std::char_traits<char>::eof() || values["channel_mapping"].back() == ',') {
+		return std::nullopt;
+	}
+	return result;
+}
+
+std::vector<uint8_t> multiOpusHeader(const MultiOpusConfig &config)
+{
+	// OpusHead: magic, version 1, 6 channels, pre-skip 0, 48000 Hz input rate
+	// (little-endian), 0 dB output gain. Mapping family 255 preserves SDP
+	// output-slot order; family 1 would apply an additional Vorbis-to-speaker
+	// reorder to already ordered WebRTC audio.
+	static const uint8_t kOpusHead[] = {'O', 'p', 'u', 's', 'H', 'e', 'a', 'd', 1, 6, 0, 0, 0x80, 0xbb, 0, 0, 0, 0};
+	std::vector<uint8_t> header(std::begin(kOpusHead), std::end(kOpusHead));
+	header.push_back(255);
+	header.push_back(config.streams);
+	header.push_back(config.coupledStreams);
+	header.insert(header.end(), config.mapping.begin(), config.mapping.end());
+	return header;
+}
+
+std::string buildViewerRequestMessage(uint32_t width, uint32_t height, bool guest, const std::string &viewerInfoJson)
+{
+	JsonBuilder request;
+	request.add("downloads", false)
+	    .add("allowmidi", false)
+	    .add("allowdrawing", false)
+	    .add("iframe", false)
+	    .add("widget", false)
+	    .add("audio", true)
+	    .add("video", true)
+	    .add("broadcast", false)
+	    .add("allowwebp", false)
+	    .add("allowscreenaudio", false)
+	    .add("allowscreenvideo", false)
+	    .add("allowchunked", false)
+	    .add("allowresources", false)
+	    .add("degrade", "maintain-resolution")
+	    .add("bitrate", chooseViewerTargetBitrateKbps(width, height))
+	    .add("targetBitrate", chooseViewerTargetBitrateKbps(width, height));
+
+	if (guest) {
+		request.add("guest", true);
+	}
+
+	if (width > 0 || height > 0) {
+		JsonBuilder resolution;
+		if (width > 0) {
+			resolution.add("w", static_cast<int>(width));
+		}
+		if (height > 0) {
+			resolution.add("h", static_cast<int>(height));
+		}
+		request.addRaw("requestResolution", resolution.build());
+	}
+
+	if (!viewerInfoJson.empty()) {
+		request.addRaw("info", viewerInfoJson);
+	}
+
+	return request.build();
+}
+
+std::vector<std::string> buildIncomingSignalingPasswordCandidates(const std::string &messageStreamId,
+                                                                  const std::string &defaultPassword,
+                                                                  const StreamInfo &publishedStream,
+                                                                  const std::vector<StreamInfo> &viewingStreams,
+                                                                  const RoomInfo &currentRoom)
+{
+	std::vector<std::string> candidates;
+	auto addCandidate = [&candidates](const std::string &password) {
+		if (password.empty() || std::find(candidates.begin(), candidates.end(), password) != candidates.end()) {
+			return;
+		}
+		candidates.push_back(password);
+	};
+
+	auto matchesStream = [&messageStreamId](const StreamInfo &stream) {
+		return !messageStreamId.empty() &&
+		       (messageStreamId == stream.streamId || messageStreamId == stream.hashedStreamId);
+	};
+
+	if (matchesStream(publishedStream)) {
+		addCandidate(publishedStream.password);
+	}
+
+	for (const auto &stream : viewingStreams) {
+		if (matchesStream(stream)) {
+			addCandidate(stream.password);
+		}
+	}
+
+	addCandidate(publishedStream.password);
+	for (const auto &stream : viewingStreams) {
+		addCandidate(stream.password);
+	}
+	addCandidate(currentRoom.password);
+	addCandidate(defaultPassword);
+
+	return candidates;
+}
+
+std::string sanitizeStreamId(const std::string &streamId)
+{
+	return sanitizeIdentifier(streamId, 64);
+}
+
+// JSON Builder implementation
+static std::string quoteJsonString(const std::string &value)
+{
+	std::string escaped;
+	escaped.reserve(value.size() + 2);
+	escaped += '"';
+	for (char c : value) {
+		switch (c) {
+		case '"':
+			escaped += "\\\"";
+			break;
+		case '\\':
+			escaped += "\\\\";
+			break;
+		case '\b':
+			escaped += "\\b";
+			break;
+		case '\f':
+			escaped += "\\f";
+			break;
+		case '\n':
+			escaped += "\\n";
+			break;
+		case '\r':
+			escaped += "\\r";
+			break;
+		case '\t':
+			escaped += "\\t";
+			break;
+		default:
+			if (static_cast<unsigned char>(c) < 0x20) {
+				static constexpr char hex[] = "0123456789abcdef";
+				escaped += "\\u00";
+				escaped += hex[static_cast<unsigned char>(c) >> 4];
+				escaped += hex[static_cast<unsigned char>(c) & 0x0F];
+			} else {
+				escaped += c;
+			}
+			break;
+		}
+	}
+	escaped += '"';
+	return escaped;
+}
+
+JsonBuilder &JsonBuilder::add(const std::string &key, const std::string &value)
+{
+	entries_.emplace_back(key, quoteJsonString(value));
+	return *this;
+}
+
+JsonBuilder &JsonBuilder::add(const std::string &key, const char *value)
+{
+	return add(key, std::string(value));
+}
+
+JsonBuilder &JsonBuilder::add(const std::string &key, int value)
+{
+	entries_.emplace_back(key, std::to_string(value));
+	return *this;
+}
+
+JsonBuilder &JsonBuilder::add(const std::string &key, int64_t value)
+{
+	entries_.emplace_back(key, std::to_string(value));
+	return *this;
+}
+
+JsonBuilder &JsonBuilder::add(const std::string &key, bool value)
+{
+	entries_.emplace_back(key, value ? "true" : "false");
+	return *this;
+}
+
+JsonBuilder &JsonBuilder::addRaw(const std::string &key, const std::string &rawJson)
+{
+	entries_.emplace_back(key, rawJson);
+	return *this;
+}
+
+std::string JsonBuilder::build() const
+{
+	std::stringstream ss;
+	ss << "{";
+	for (size_t i = 0; i < entries_.size(); i++) {
+		if (i > 0)
+			ss << ",";
+		ss << quoteJsonString(entries_[i].first) << ":" << entries_[i].second;
+	}
+	ss << "}";
+	return ss.str();
+}
+
+// JSON Parser implementation
+JsonParser::JsonParser(const std::string &json) : json_(json)
+{
+	parse();
+}
+
+static bool appendJsonUnicodeEscape(const std::string &input, size_t &pos, std::string &value)
+{
+	auto readHex = [&](size_t start, uint32_t &code) {
+		if (start > input.size() || input.size() - start < 4)
+			return false;
+		code = 0;
+		for (size_t i = start; i < start + 4; ++i) {
+			const char c = input[i];
+			const int digit = c >= '0' && c <= '9'   ? c - '0'
+			                  : c >= 'a' && c <= 'f' ? c - 'a' + 10
+			                  : c >= 'A' && c <= 'F' ? c - 'A' + 10
+			                                         : -1;
+			if (digit < 0)
+				return false;
+			code = (code << 4) | static_cast<uint32_t>(digit);
+		}
+		return true;
+	};
+
+	uint32_t code = 0;
+	if (!readHex(pos + 1, code))
+		return false;
+	size_t last = pos + 4;
+	if (code >= 0xD800 && code <= 0xDBFF) {
+		uint32_t low = 0;
+		if (input.size() - last < 7 || input[last + 1] != '\\' || input[last + 2] != 'u' || !readHex(last + 3, low) ||
+		    low < 0xDC00 || low > 0xDFFF)
+			return false;
+		code = 0x10000 + ((code - 0xD800) << 10) + low - 0xDC00;
+		last += 6;
+	} else if (code >= 0xDC00 && code <= 0xDFFF) {
+		return false;
+	}
+
+	if (code < 0x80) {
+		value += static_cast<char>(code);
+	} else {
+		const int continuationBytes = code < 0x800 ? 1 : code < 0x10000 ? 2 : 3;
+		const uint32_t prefix = continuationBytes == 1 ? 0xC0 : continuationBytes == 2 ? 0xE0 : 0xF0;
+		value += static_cast<char>(prefix | (code >> (6 * continuationBytes)));
+		for (int shift = 6 * (continuationBytes - 1); shift >= 0; shift -= 6)
+			value += static_cast<char>(0x80 | ((code >> shift) & 0x3F));
+	}
+	pos = last;
+	return true;
+}
+
+static std::string extractJsonString(const std::string &input, size_t &pos)
+{
+	std::string value;
+	pos++; // Skip opening quote
+	while (pos < input.size() && input[pos] != '"') {
+		if (input[pos] == '\\' && pos + 1 < input.size()) {
+			pos++;
+			switch (input[pos]) {
+			case 'u':
+				if (!appendJsonUnicodeEscape(input, pos, value))
+					value += 'u'; // Preserve the existing tolerant handling of malformed escapes.
+				break;
+			case 'b':
+				value += '\b';
+				break;
+			case 'f':
+				value += '\f';
+				break;
+			case 'n':
+				value += '\n';
+				break;
+			case 'r':
+				value += '\r';
+				break;
+			case 't':
+				value += '\t';
+				break;
+			case '"':
+				value += '"';
+				break;
+			case '\\':
+				value += '\\';
+				break;
+			default:
+				value += input[pos];
+				break;
+			}
+		} else {
+			value += input[pos];
+		}
+		pos++;
+	}
+	pos++; // Skip closing quote
+	return value;
+}
+
+void JsonParser::parse()
+{
+	// Simple JSON parser - handles basic key-value pairs
+	size_t pos = 0;
+	const auto isWhitespace = [](char ch) { return std::isspace(static_cast<unsigned char>(ch)) != 0; };
+
+	// Skip whitespace and opening brace
+	while (pos < json_.size() && (isWhitespace(json_[pos]) || json_[pos] == '{'))
+		pos++;
+
+	while (pos < json_.size() && json_[pos] != '}') {
+		// Skip whitespace
+		while (pos < json_.size() && isWhitespace(json_[pos]))
+			pos++;
+		if (pos >= json_.size() || json_[pos] == '}') {
+			break;
+		}
+
+		if (json_[pos] != '"')
+			break;
+		const std::string key = extractJsonString(json_, pos);
+
+		// Skip to colon
+		while (pos < json_.size() && json_[pos] != ':')
+			pos++;
+		if (pos >= json_.size()) {
+			break;
+		}
+		pos++; // Skip colon
+
+		// Skip whitespace
+		while (pos < json_.size() && isWhitespace(json_[pos]))
+			pos++;
+		if (pos >= json_.size()) {
+			break;
+		}
+
+		// Extract value
+		std::string value = extractValue(pos);
+		values_[key] = value;
+
+		// Skip comma and whitespace
+		while (pos < json_.size() && (isWhitespace(json_[pos]) || json_[pos] == ','))
+			pos++;
+	}
+}
+
+std::string JsonParser::extractValue(size_t &pos) const
+{
+	std::string value;
+	if (pos >= json_.size()) {
+		return value;
+	}
+
+	if (json_[pos] == '"') {
+		value = extractJsonString(json_, pos);
+	} else if (json_[pos] == '{') {
+		// Object - capture the whole thing, skipping over string literals
+		int depth = 1;
+		value += json_[pos++];
+		while (pos < json_.size() && depth > 0) {
+			if (json_[pos] == '"') {
+				value += json_[pos++];
+				while (pos < json_.size() && json_[pos] != '"') {
+					if (json_[pos] == '\\' && pos + 1 < json_.size()) {
+						value += json_[pos++];
+					}
+					value += json_[pos++];
+				}
+				if (pos < json_.size())
+					value += json_[pos++];
+			} else {
+				if (json_[pos] == '{')
+					depth++;
+				else if (json_[pos] == '}')
+					depth--;
+				value += json_[pos++];
+			}
+		}
+	} else if (json_[pos] == '[') {
+		// Array - capture the whole thing, skipping over string literals
+		int depth = 1;
+		value += json_[pos++];
+		while (pos < json_.size() && depth > 0) {
+			if (json_[pos] == '"') {
+				value += json_[pos++];
+				while (pos < json_.size() && json_[pos] != '"') {
+					if (json_[pos] == '\\' && pos + 1 < json_.size()) {
+						value += json_[pos++];
+					}
+					value += json_[pos++];
+				}
+				if (pos < json_.size())
+					value += json_[pos++];
+			} else {
+				if (json_[pos] == '[')
+					depth++;
+				else if (json_[pos] == ']')
+					depth--;
+				value += json_[pos++];
+			}
+		}
+	} else {
+		// Number, boolean, or null
+		while (pos < json_.size() && json_[pos] != ',' && json_[pos] != '}' &&
+		       !std::isspace(static_cast<unsigned char>(json_[pos]))) {
+			value += json_[pos++];
+		}
+	}
+
+	return value;
+}
+
+bool JsonParser::hasKey(const std::string &key) const
+{
+	return values_.find(key) != values_.end();
+}
+
+std::string JsonParser::getString(const std::string &key, const std::string &defaultValue) const
+{
+	auto it = values_.find(key);
+	if (it != values_.end()) {
+		return it->second;
+	}
+	return defaultValue;
+}
+
+int JsonParser::getInt(const std::string &key, int defaultValue) const
+{
+	auto it = values_.find(key);
+	if (it != values_.end()) {
+		try {
+			return std::stoi(it->second);
+		} catch (...) {
+			return defaultValue;
+		}
+	}
+	return defaultValue;
+}
+
+bool JsonParser::getBool(const std::string &key, bool defaultValue) const
+{
+	auto it = values_.find(key);
+	if (it != values_.end()) {
+		return it->second == "true";
+	}
+	return defaultValue;
+}
+
+std::string JsonParser::getRaw(const std::string &key) const
+{
+	auto it = values_.find(key);
+	if (it != values_.end()) {
+		return it->second;
+	}
+	return "";
+}
+
+std::string JsonParser::getObject(const std::string &key) const
+{
+	return getRaw(key);
+}
+
+std::vector<std::string> JsonParser::getArray(const std::string &key) const
+{
+	std::vector<std::string> result;
+	std::string arr = getRaw(key);
+	const auto isWhitespace = [](char ch) { return std::isspace(static_cast<unsigned char>(ch)) != 0; };
+
+	if (arr.empty() || arr[0] != '[')
+		return result;
+
+	size_t pos = 1;
+	while (pos < arr.size() && arr[pos] != ']') {
+		while (pos < arr.size() && isWhitespace(arr[pos]))
+			pos++;
+		if (pos >= arr.size()) {
+			break;
+		}
+
+		if (arr[pos] == ']')
+			break;
+
+		// This is a simplified extraction - real impl would need full parser
+		std::string value;
+		const bool stringElement = arr[pos] == '"';
+		if (stringElement) {
+			value = extractJsonString(arr, pos);
+		} else if (arr[pos] == '{') {
+			int depth = 1;
+			value += arr[pos++];
+			while (pos < arr.size() && depth > 0) {
+				if (arr[pos] == '"') {
+					value += arr[pos++];
+					while (pos < arr.size() && arr[pos] != '"') {
+						if (arr[pos] == '\\' && pos + 1 < arr.size()) {
+							value += arr[pos++];
+						}
+						value += arr[pos++];
+					}
+					if (pos < arr.size())
+						value += arr[pos++];
+				} else {
+					if (arr[pos] == '{')
+						depth++;
+					else if (arr[pos] == '}')
+						depth--;
+					value += arr[pos++];
+				}
+			}
+		} else if (arr[pos] == '[') {
+			int depth = 1;
+			value += arr[pos++];
+			while (pos < arr.size() && depth > 0) {
+				if (arr[pos] == '"') {
+					value += arr[pos++];
+					while (pos < arr.size() && arr[pos] != '"') {
+						if (arr[pos] == '\\' && pos + 1 < arr.size()) {
+							value += arr[pos++];
+						}
+						value += arr[pos++];
+					}
+					if (pos < arr.size())
+						value += arr[pos++];
+				} else {
+					if (arr[pos] == '[')
+						depth++;
+					else if (arr[pos] == ']')
+						depth--;
+					value += arr[pos++];
+				}
+			}
+		} else {
+			while (pos < arr.size() && arr[pos] != ',' && arr[pos] != ']') {
+				if (!isWhitespace(arr[pos])) {
+					value += arr[pos];
+				}
+				pos++;
+			}
+		}
+
+		if (stringElement || !value.empty()) {
+			result.push_back(value);
+		}
+
+		while (pos < arr.size() && (isWhitespace(arr[pos]) || arr[pos] == ','))
+			pos++;
+	}
+
+	return result;
+}
+
+// String utilities
+std::string base64Encode(const std::vector<uint8_t> &data)
+{
+	static const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+	std::string result;
+	result.reserve(((data.size() + 2) / 3) * 4);
+
+	for (size_t i = 0; i < data.size(); i += 3) {
+		uint32_t n = data[i] << 16;
+		if (i + 1 < data.size())
+			n |= data[i + 1] << 8;
+		if (i + 2 < data.size())
+			n |= data[i + 2];
+
+		result += charset[(n >> 18) & 0x3F];
+		result += charset[(n >> 12) & 0x3F];
+		result += (i + 1 < data.size()) ? charset[(n >> 6) & 0x3F] : '=';
+		result += (i + 2 < data.size()) ? charset[n & 0x3F] : '=';
+	}
+
+	return result;
+}
+
+std::vector<uint8_t> base64Decode(const std::string &encoded)
+{
+	static const uint8_t lookup[256] = {
+	    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+	    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 62, 64, 64, 64, 63, 52, 53, 54, 55,
+	    56, 57, 58, 59, 60, 61, 64, 64, 64, 64, 64, 64, 64, 0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12,
+	    13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 64, 64, 64, 64, 64, 64, 26, 27, 28, 29, 30, 31, 32,
+	    33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 64, 64, 64, 64, 64,
+	};
+
+	std::vector<uint8_t> result;
+	result.reserve(encoded.size() * 3 / 4);
+
+	uint32_t buffer = 0;
+	int bits = 0;
+
+	for (char c : encoded) {
+		if (c == '=')
+			break;
+		// Only the ASCII half of the lookup table is initialized explicitly.
+		if (static_cast<unsigned char>(c) >= 128)
+			continue;
+		uint8_t val = lookup[static_cast<unsigned char>(c)];
+		if (val == 64)
+			continue;
+
+		buffer = (buffer << 6) | val;
+		bits += 6;
+
+		if (bits >= 8) {
+			bits -= 8;
+			result.push_back((buffer >> bits) & 0xFF);
+		}
+	}
+
+	return result;
+}
+
+std::string urlEncode(const std::string &value)
+{
+	std::ostringstream escaped;
+	escaped.fill('0');
+	escaped << std::hex;
+
+	for (char c : value) {
+		if (isAsciiAlphanumeric(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+			escaped << c;
+		} else {
+			escaped << '%' << std::setw(2) << int(static_cast<unsigned char>(c));
+		}
+	}
+
+	return escaped.str();
+}
+
+std::string jsEncodeURIComponent(const std::string &value)
+{
+	std::ostringstream escaped;
+	escaped.fill('0');
+	escaped << std::hex << std::uppercase;
+
+	for (char c : value) {
+		// JS encodeURIComponent preserves: A-Z a-z 0-9 - _ . ! ~ * ' ( )
+		if (isAsciiAlphanumeric(c) || c == '-' || c == '_' || c == '.' || c == '!' || c == '~' || c == '*' ||
+		    c == '\'' || c == '(' || c == ')') {
+			escaped << c;
+		} else {
+			escaped << '%' << std::setw(2) << int(static_cast<unsigned char>(c));
+		}
+	}
+
+	return escaped.str();
+}
+
+std::string trim(const std::string &str)
+{
+	size_t start = str.find_first_not_of(" \t\r\n");
+	if (start == std::string::npos)
+		return "";
+	size_t end = str.find_last_not_of(" \t\r\n");
+	return str.substr(start, end - start + 1);
+}
+
+std::vector<std::string> split(const std::string &str, char delimiter)
+{
+	std::vector<std::string> result;
+	if (str.empty()) {
+		result.push_back("");
+		return result;
+	}
+	std::stringstream ss(str);
+	std::string item;
+	while (std::getline(ss, item, delimiter)) {
+		result.push_back(item);
+	}
+	return result;
+}
+
+std::vector<IceServer> parseIceServers(const std::string &config)
+{
+	std::vector<IceServer> servers;
+	std::stringstream lines(config);
+	std::string rawLine;
+
+	auto parseEntry = [&](const std::string &entryValue) {
+		std::string line = trim(entryValue);
+		if (line.empty() || startsWithInsensitive(line, "#") || startsWithInsensitive(line, "//")) {
+			return;
+		}
+
+		IceServer server;
+
+		if (line.find('|') != std::string::npos) {
+			const std::vector<std::string> parts = split(line, '|');
+			if (!parts.empty()) {
+				server.urls = trim(parts[0]);
+			}
+			if (parts.size() > 1) {
+				server.username = trim(parts[1]);
+			}
+			if (parts.size() > 2) {
+				server.credential = trim(parts[2]);
+			}
+		} else if (line.find(',') != std::string::npos) {
+			const std::vector<std::string> parts = split(line, ',');
+			if (!parts.empty()) {
+				server.urls = trim(parts[0]);
+			}
+			if (parts.size() > 1) {
+				server.username = trim(parts[1]);
+			}
+			if (parts.size() > 2) {
+				server.credential = trim(parts[2]);
+			}
+		} else {
+			std::stringstream tokenStream(line);
+			std::string token;
+			std::vector<std::string> tokens;
+			while (tokenStream >> token) {
+				tokens.push_back(token);
+			}
+
+			if (!tokens.empty()) {
+				server.urls = trim(tokens[0]);
+			}
+
+			for (size_t i = 1; i < tokens.size(); ++i) {
+				std::string value = trim(tokens[i]);
+				const size_t equalsPos = value.find('=');
+				if (equalsPos != std::string::npos) {
+					std::string key = value.substr(0, equalsPos);
+					std::string mapped = value.substr(equalsPos + 1);
+					std::transform(key.begin(), key.end(), key.begin(),
+					               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+					if (key == "username" || key == "user") {
+						server.username = mapped;
+						continue;
+					}
+					if (key == "credential" || key == "password" || key == "pass") {
+						server.credential = mapped;
+						continue;
+					}
+				}
+
+				if (server.username.empty()) {
+					server.username = value;
+				} else if (server.credential.empty()) {
+					server.credential = value;
+				}
+			}
+		}
+
+		server.urls = trim(server.urls);
+		server.username = trim(server.username);
+		server.credential = trim(server.credential);
+		if (!server.urls.empty() && isIceUrl(server.urls) && hasValidIceUrlShape(server.urls)) {
+			servers.push_back(std::move(server));
+		}
+	};
+
+	while (std::getline(lines, rawLine)) {
+		const std::vector<std::string> entries = split(rawLine, ';');
+		for (const auto &entry : entries) {
+			parseEntry(entry);
+		}
+	}
+
+	return servers;
+}
+
+bool countsTowardViewerLimit(ConnectionState state)
+{
+	switch (state) {
+	case ConnectionState::New:
+	case ConnectionState::Connecting:
+	case ConnectionState::Connected:
+		return true;
+	case ConnectionState::Disconnected:
+	case ConnectionState::Failed:
+	case ConnectionState::Closed:
+	default:
+		return false;
+	}
+}
+
+AspectFitLayout computeAspectFitLayout(uint32_t sourceWidth, uint32_t sourceHeight, uint32_t outputWidth,
+                                       uint32_t outputHeight)
+{
+	AspectFitLayout layout;
+	layout.outputWidth = outputWidth;
+	layout.outputHeight = outputHeight;
+
+	if (layout.outputWidth == 0) {
+		layout.outputWidth = sourceWidth;
+	}
+	if (layout.outputHeight == 0) {
+		layout.outputHeight = sourceHeight;
+	}
+	if (layout.outputWidth == 0) {
+		layout.outputWidth = 1;
+	}
+	if (layout.outputHeight == 0) {
+		layout.outputHeight = 1;
+	}
+
+	if (sourceWidth == 0 || sourceHeight == 0) {
+		layout.contentWidth = layout.outputWidth;
+		layout.contentHeight = layout.outputHeight;
+		return layout;
+	}
+
+	const double widthScale = static_cast<double>(layout.outputWidth) / static_cast<double>(sourceWidth);
+	const double heightScale = static_cast<double>(layout.outputHeight) / static_cast<double>(sourceHeight);
+	const double scale = std::min(widthScale, heightScale);
+
+	layout.contentWidth =
+	    std::max<uint32_t>(1, static_cast<uint32_t>(std::lround(static_cast<double>(sourceWidth) * scale)));
+	layout.contentHeight =
+	    std::max<uint32_t>(1, static_cast<uint32_t>(std::lround(static_cast<double>(sourceHeight) * scale)));
+	layout.contentWidth = std::min(layout.contentWidth, layout.outputWidth);
+	layout.contentHeight = std::min(layout.contentHeight, layout.outputHeight);
+	layout.offsetX = (layout.outputWidth - layout.contentWidth) / 2;
+	layout.offsetY = (layout.outputHeight - layout.contentHeight) / 2;
+	return layout;
+}
+
+SignalingConnectErrorCategory classifySignalingConnectError(const std::string &error)
+{
+	const std::string normalized = trim(error);
+	if (normalized.empty()) {
+		return SignalingConnectErrorCategory::Unknown;
+	}
+
+	if (containsInsensitive(normalized, "tls connection failed") || containsInsensitive(normalized, "certificate") ||
+	    containsInsensitive(normalized, "x509") || containsInsensitive(normalized, "unknown ca") ||
+	    containsInsensitive(normalized, "hostname mismatch") || containsInsensitive(normalized, "handshake failure")) {
+		return SignalingConnectErrorCategory::Tls;
+	}
+
+	if (containsInsensitive(normalized, "tcp connection failed") || containsInsensitive(normalized, "timed out") ||
+	    containsInsensitive(normalized, "timeout") || containsInsensitive(normalized, "connection refused") ||
+	    containsInsensitive(normalized, "network is unreachable") ||
+	    containsInsensitive(normalized, "no route to host") ||
+	    containsInsensitive(normalized, "name or service not known") ||
+	    containsInsensitive(normalized, "temporary failure in name resolution") ||
+	    containsInsensitive(normalized, "nodename nor servname")) {
+		return SignalingConnectErrorCategory::Tcp;
+	}
+
+	if (containsInsensitive(normalized, "websocket connection failed") || containsInsensitive(normalized, "upgrade") ||
+	    containsInsensitive(normalized, "unexpected http response") ||
+	    containsInsensitive(normalized, "bad http response") || containsInsensitive(normalized, "http status")) {
+		return SignalingConnectErrorCategory::WebSocketHandshake;
+	}
+
+	return SignalingConnectErrorCategory::Unknown;
+}
+
+const char *signalingConnectErrorCategoryName(SignalingConnectErrorCategory category)
+{
+	switch (category) {
+	case SignalingConnectErrorCategory::Tcp:
+		return "tcp";
+	case SignalingConnectErrorCategory::Tls:
+		return "tls";
+	case SignalingConnectErrorCategory::WebSocketHandshake:
+		return "websocket-handshake";
+	case SignalingConnectErrorCategory::Unknown:
+	default:
+		return "unknown";
+	}
+}
+
+const char *signalingConnectErrorLikelyCauses(SignalingConnectErrorCategory category)
+{
+	switch (category) {
+	case SignalingConnectErrorCategory::Tcp:
+		return "DNS failure, bad route, firewall/VPN/proxy blocking port 443, or the server/edge being unreachable";
+	case SignalingConnectErrorCategory::Tls:
+		return "wrong system clock, outdated CA bundle/OpenSSL, HTTPS interception, wrong IP/edge on port 443, or a "
+		       "server/network device closing during TLS handshake";
+	case SignalingConnectErrorCategory::WebSocketHandshake:
+		return "HTTP upgrade rejected by a reverse proxy/WAF, a non-WebSocket endpoint, or a middlebox altering the "
+		       "WebSocket request";
+	case SignalingConnectErrorCategory::Unknown:
+	default:
+		return "check the surrounding [VDO.Ninja/RTC] lines; likely candidates are DNS/routing issues, TLS "
+		       "interception, or the remote closing before WebSocket open";
+	}
+}
+
+std::vector<std::string> buildCaCertificateCandidatePaths(const std::string &sslCertFileEnv,
+                                                          const std::vector<std::string> &moduleDirs)
+{
+	std::vector<std::string> candidates;
+	auto addCandidate = [&candidates](const std::string &path) {
+		if (path.empty()) {
+			return;
+		}
+		if (std::find(candidates.begin(), candidates.end(), path) != candidates.end()) {
+			return;
+		}
+		candidates.push_back(path);
+	};
+
+	// 1. Explicit user/environment override wins.
+	addCandidate(trim(sslCertFileEnv));
+
+	// 2. A CA bundle shipped next to the plugin binary. On macOS the plugin
+	//    lives at <bundle>/Contents/MacOS/obs-vdoninja, so also probe the
+	//    sibling Resources/data directory used for plugin resources.
+	for (const std::string &dir : moduleDirs) {
+		std::string base = trim(dir);
+		while (base.size() > 1 && base.back() == '/') {
+			base.pop_back();
+		}
+		if (base.empty()) {
+			continue;
+		}
+		addCandidate(base + "/" + kBundledCaCertificateFileName);
+		addCandidate(base + "/../Resources/data/" + kBundledCaCertificateFileName);
+	}
+
+	// 3. Well-known system trust stores as a last resort.
+	static const char *const kSystemCaBundles[] = {
+	    "/etc/ssl/cert.pem",                    // macOS, some BSDs
+	    "/etc/ssl/certs/ca-certificates.crt",   // Debian/Ubuntu/Alpine
+	    "/etc/pki/tls/certs/ca-bundle.crt",     // RHEL/Fedora/CentOS
+	    "/etc/ssl/ca-bundle.pem",               // openSUSE
+	    "/usr/local/etc/openssl@3/cert.pem",    // Intel Homebrew OpenSSL 3
+	    "/opt/homebrew/etc/openssl@3/cert.pem", // Apple Silicon Homebrew OpenSSL 3
+	};
+	for (const char *path : kSystemCaBundles) {
+		addCandidate(path);
+	}
+
+	return candidates;
+}
+
+// Time utilities
+int64_t currentTimeMs()
+{
+	using namespace std::chrono;
+	return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
+
+std::string formatTimestamp(int64_t ms)
+{
+	time_t seconds = ms / 1000;
+	struct tm timeinfo;
+#ifdef _WIN32
+	localtime_s(&timeinfo, &seconds);
+#else
+	localtime_r(&seconds, &timeinfo);
+#endif
+	char buffer[32];
+	strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+	return std::string(buffer);
+}
+
+// SDP manipulation
+std::string modifySdpForCodec(const std::string &sdp, VideoCodec codec)
+{
+	// For now, return SDP as-is. Full implementation would reorder codec preferences
+	// based on the desired codec
+	(void)codec;
+	return sdp;
+}
+
+std::string modifySdpBitrate(const std::string &sdp, int bitrate)
+{
+	// Add b=AS line for bandwidth limiting
+	std::string result = sdp;
+	std::string bLine = "b=AS:" + std::to_string(bitrate / 1000) + "\r\n";
+
+	// Find m=video line and add bandwidth after it
+	size_t videoPos = result.find("m=video");
+	if (videoPos != std::string::npos) {
+		size_t lineEnd = result.find("\r\n", videoPos);
+		if (lineEnd != std::string::npos) {
+			result.insert(lineEnd + 2, bLine);
+		}
+	}
+
+	return result;
+}
+
+std::string extractMid(const std::string &sdp, const std::string &mediaType)
+{
+	std::istringstream input(sdp);
+	std::string line;
+	bool matchingMedia = false;
+	while (std::getline(input, line)) {
+		if (!line.empty() && line.back() == '\r')
+			line.pop_back();
+		if (line.rfind("m=", 0) == 0) {
+			if (matchingMedia)
+				break;
+			const auto tokens = splitWhitespace(line.substr(2));
+			matchingMedia = !tokens.empty() && tokens.front() == mediaType;
+		} else if (matchingMedia && line.rfind("a=mid:", 0) == 0) {
+			return line.substr(6);
+		}
+	}
+	return "";
+}
+
+std::string stripUnsupportedTransportCcFeedback(const std::string &sdp)
+{
+	std::stringstream input(sdp);
+	std::string line;
+	std::string filtered;
+	bool stripped = false;
+
+	while (std::getline(input, line)) {
+		if (!line.empty() && line.back() == '\r') {
+			line.pop_back();
+		}
+		if (line.find("transport-wide-cc-extensions-01") != std::string::npos) {
+			stripped = true;
+			continue;
+		}
+		if (line.rfind("a=rtcp-fb:", 0) == 0 && line.find("transport-cc") != std::string::npos) {
+			stripped = true;
+			continue;
+		}
+		filtered += line + "\r\n";
+	}
+
+	return stripped ? filtered : sdp;
+}
+
+std::vector<SdpOfferedMediaSection> parseOfferedMediaSections(const std::string &sdp)
+{
+	std::vector<SdpOfferedMediaSection> sections;
+	SdpOfferedMediaSection *current = nullptr;
+	std::string sessionDirection = "sendrecv";
+	bool inMediaSection = false;
+
+	std::stringstream input(sdp);
+	std::string line;
+	while (std::getline(input, line)) {
+		if (!line.empty() && line.back() == '\r') {
+			line.pop_back();
+		}
+
+		if (line.rfind("m=", 0) == 0) {
+			inMediaSection = true;
+			const auto tokens = splitWhitespace(line.substr(2));
+			if (tokens.empty()) {
+				current = nullptr;
+				continue;
+			}
+
+			const std::string mediaType = asciiLowerCopy(tokens[0]);
+			if (mediaType != "audio" && mediaType != "video") {
+				current = nullptr;
+				continue;
+			}
+
+			sections.push_back({});
+			current = &sections.back();
+			current->type = mediaType;
+			current->direction = sessionDirection;
+			if (tokens.size() > 1) {
+				current->port = parseIntOrDefault(tokens[1], -1);
+			}
+			for (size_t i = 3; i < tokens.size(); ++i) {
+				const int payloadType = parseIntOrDefault(tokens[i]);
+				if (payloadType >= 0) {
+					current->payloadTypes.push_back(payloadType);
+				}
+			}
+			continue;
+		}
+
+		if (line == "a=sendrecv" || line == "a=sendonly" || line == "a=recvonly" || line == "a=inactive") {
+			if (current) {
+				current->direction = line.substr(2);
+			} else if (!inMediaSection) {
+				sessionDirection = line.substr(2);
+			}
+			continue;
+		}
+
+		if (!current) {
+			continue;
+		}
+
+		if (line.rfind("a=mid:", 0) == 0) {
+			current->mid = trim(line.substr(6));
+			continue;
+		}
+
+		if (line == "a=bundle-only") {
+			current->bundleOnly = true;
+			continue;
+		}
+
+		if (line.rfind("a=extmap:", 0) == 0) {
+			const auto tokens = splitWhitespace(line.substr(9));
+			if (tokens.size() < 2)
+				continue;
+			const auto parts = split(tokens[0], '/');
+			if (parts.empty() || parts.size() > 2 || parts[0].empty() ||
+			    !std::all_of(parts[0].begin(), parts[0].end(), [](char c) { return c >= '0' && c <= '9'; }))
+				continue;
+			const int id = parseIntOrDefault(parts[0], -1);
+			if (id >= 1 && id <= 255)
+				current->headerExtensions.push_back({id, parts.size() == 2 ? parts[1] : "sendrecv", tokens[1]});
+			continue;
+		}
+
+		if (line.rfind("a=rtpmap:", 0) == 0) {
+			const size_t separator = line.find(' ');
+			if (separator == std::string::npos) {
+				continue;
+			}
+
+			const int payloadType = parseIntOrDefault(line.substr(9, separator - 9));
+			if (payloadType < 0 || !containsPayloadType(current->payloadTypes, payloadType)) {
+				continue;
+			}
+
+			SdpOfferedCodec *codec = findCodecByPayloadType(current->codecs, payloadType);
+			if (!codec) {
+				current->codecs.push_back({});
+				codec = &current->codecs.back();
+				codec->payloadType = payloadType;
+			}
+
+			const auto descriptorParts = split(line.substr(separator + 1), '/');
+			if (!descriptorParts.empty()) {
+				codec->codec = descriptorParts[0];
+			}
+			if (descriptorParts.size() > 1) {
+				codec->clockRate = parseIntOrDefault(descriptorParts[1], 0);
+			}
+			if (descriptorParts.size() > 2) {
+				codec->channels = parseIntOrDefault(descriptorParts[2], 0);
+			}
+			continue;
+		}
+
+		if (line.rfind("a=fmtp:", 0) == 0) {
+			const size_t separator = line.find(' ');
+			if (separator == std::string::npos) {
+				continue;
+			}
+
+			const int payloadType = parseIntOrDefault(line.substr(7, separator - 7));
+			if (payloadType < 0 || !containsPayloadType(current->payloadTypes, payloadType)) {
+				continue;
+			}
+
+			SdpOfferedCodec *codec = findCodecByPayloadType(current->codecs, payloadType);
+			if (!codec) {
+				current->codecs.push_back({});
+				codec = &current->codecs.back();
+				codec->payloadType = payloadType;
+			}
+
+			codec->formatParameters = trim(line.substr(separator + 1));
+			const std::string fmtpLower = asciiLowerCopy(codec->formatParameters);
+			codec->associatedPayloadType = -1;
+			for (const auto &parameter : split(fmtpLower, ';')) {
+				const std::string field = trim(parameter);
+				if (field.rfind("apt=", 0) != 0) {
+					continue;
+				}
+				const std::string value = field.substr(4);
+				if (!value.empty() &&
+				    std::all_of(value.begin(), value.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+					codec->associatedPayloadType = parseIntOrDefault(value);
+				}
+				break;
+			}
+		}
+	}
+
+	return sections;
+}
+
+bool offeredMediaSectionCanSend(const SdpOfferedMediaSection &section)
+{
+	return section.port != 0 && section.direction != "inactive" && section.direction != "recvonly";
+}
+
+bool offerHasActiveVp9AlphaSection(const std::vector<SdpOfferedMediaSection> &sections)
+{
+	size_t videoSectionIndex = 0;
+	for (const auto &section : sections) {
+		if (section.type != "video") {
+			continue;
+		}
+		const std::string midLower = asciiLowerCopy(section.mid);
+		const bool isAlphaSection = midLower.find("alpha") != std::string::npos || videoSectionIndex > 0;
+		videoSectionIndex++;
+		if (!isAlphaSection || !offeredMediaSectionCanSend(section)) {
+			continue;
+		}
+		const auto codec = std::find_if(section.codecs.begin(), section.codecs.end(),
+		                                [](const auto &candidate) { return asciiLowerCopy(candidate.codec) == "vp9"; });
+		if (codec != section.codecs.end()) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Logging
+void logInfo(const char *format, ...)
+{
+	va_list args;
+	va_start(args, format);
+	char buffer[1024];
+	vsnprintf(buffer, sizeof(buffer), format, args);
+	va_end(args);
+	blog(LOG_INFO, "[VDO.Ninja] %s", buffer);
+}
+
+void logWarning(const char *format, ...)
+{
+	va_list args;
+	va_start(args, format);
+	char buffer[1024];
+	vsnprintf(buffer, sizeof(buffer), format, args);
+	va_end(args);
+	blog(LOG_WARNING, "[VDO.Ninja] %s", buffer);
+}
+
+void logError(const char *format, ...)
+{
+	va_list args;
+	va_start(args, format);
+	char buffer[1024];
+	vsnprintf(buffer, sizeof(buffer), format, args);
+	va_end(args);
+	blog(LOG_ERROR, "[VDO.Ninja] %s", buffer);
+}
+
+void logDebug(const char *format, ...)
+{
+	va_list args;
+	va_start(args, format);
+	char buffer[1024];
+	vsnprintf(buffer, sizeof(buffer), format, args);
+	va_end(args);
+	blog(LOG_DEBUG, "[VDO.Ninja] %s", buffer);
+}
+
+} // namespace vdoninja
