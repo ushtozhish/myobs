@@ -218,6 +218,16 @@ void TestPlugins()
 	obs_post_load_modules();
 	const char *name = obs_source_get_display_name("myobs_clip");
 	Check(name != nullptr, "«Клип» input registered (myobs_clip)");
+	if (!name) { /* diagnose: open the module directly and report the libobs error code */
+		char *exeDir = os_get_executable_path_ptr("");
+		std::string dll = std::string(exeDir ? exeDir : "") + "../../obs-plugins/64bit/myobs-clip.dll";
+		bfree(exeDir);
+		std::printf("  plugin path: %s (exists: %d)\n", dll.c_str(), (int)os_file_exists(dll.c_str()));
+		obs_module_t *m = nullptr;
+		int r = obs_open_module(&m, dll.c_str(), nullptr);
+		std::printf("  obs_open_module = %d (0 ok, -1 not found/dll deps, -2 missing exports, -3 incompatible)\n", r);
+		if (r == 0) std::printf("  obs_init_module = %d\n", (int)obs_init_module(m));
+	}
 }
 
 } // namespace
