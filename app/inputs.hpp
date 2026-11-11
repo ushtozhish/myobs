@@ -303,6 +303,8 @@ public:
 		auto *addDeckLink = new QPushButton("+ DeckLink", this);
 		connect(addCamera, &QPushButton::clicked, this, [this]() { AddDevice("camera", "Камера"); });
 		connect(addDeckLink, &QPushButton::clicked, this, [this]() { AddDevice("decklink", "DeckLink"); });
+		auto *addNdi = new QPushButton("+ NDI", this);
+		connect(addNdi, &QPushButton::clicked, this, [this]() { AddDevice("ndi", "NDI"); });
 		connect(addClip, &QPushButton::clicked, this, [this]() { AddClipDialog(); });
 		connect(addImage, &QPushButton::clicked, this, [this]() { AddImageDialog(); });
 		connect(addColor, &QPushButton::clicked, this, [this]() { AddColorDialog(); });
@@ -311,6 +313,7 @@ public:
 		bar->addWidget(addColor);
 		bar->addWidget(addCamera);
 		bar->addWidget(addDeckLink);
+		bar->addWidget(addNdi);
 		bar->addStretch();
 		status_ = new QLabel(this);
 		status_->setObjectName("switchStatus");
@@ -422,6 +425,7 @@ private:
 		       : type == "color"    ? "Цвет"
 		       : type == "camera"   ? "Камера"
 		       : type == "decklink" ? "DeckLink"
+		       : type == "ndi"      ? "NDI"
 					    : type;
 	}
 
@@ -431,6 +435,7 @@ private:
 		       : type == "image"    ? "image_source"
 		       : type == "camera"   ? "dshow_input"
 		       : type == "decklink" ? "decklink-input"
+		       : type == "ndi"      ? "myobs_ndi"
 					    : "color_source_v3";
 	}
 

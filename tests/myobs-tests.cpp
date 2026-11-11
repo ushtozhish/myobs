@@ -395,6 +395,7 @@ void TestPlugins()
 	/* DeckLink starts only with Blackmagic Desktop Video drivers installed (not on CI): report, do not fail. */
 	std::printf("  DeckLink input: %s\n", obs_source_get_display_name("decklink-input") ? "available" : "not available (no Blackmagic drivers)");
 	Check(obs_source_get_display_name("image_source") != nullptr, "image input registered");
+	Check(obs_source_get_display_name("myobs_ndi") != nullptr, "NDI input registered (myobs_ndi)");
 	Check(obs_source_get_display_name("color_source_v3") != nullptr, "colour input registered");
 }
 

@@ -22,5 +22,6 @@ set(MYOBS_PLUGIN_DIR obs-plugins/64bit)
 
 add_subdirectory(core)
 add_subdirectory(plugins/myobs-clip)
+add_subdirectory(plugins/myobs-ndi)
 add_subdirectory(app)
 add_subdirectory(tests)

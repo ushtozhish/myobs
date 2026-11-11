@@ -206,6 +206,12 @@ private:
 				if (obs_property_list_item_disabled(p, i))
 					c->setItemData((int)i, 0, Qt::UserRole - 1);
 			}
+			if (current < 0 && fmt == OBS_COMBO_FORMAT_STRING && *obs_data_get_string(original_, name)) {
+				/* the saved choice is not offered now (device or NDI source offline): keep it visible */
+				const QString v = QString::fromUtf8(obs_data_get_string(original_, name));
+				c->addItem(v + "  (нет в сети)", v);
+				current = c->count() - 1;
+			}
 			c->setCurrentIndex(current);
 			connect(c, &QComboBox::currentIndexChanged, this, [this, p, name, c, fmt](int) {
 				const QVariant v = c->currentData();

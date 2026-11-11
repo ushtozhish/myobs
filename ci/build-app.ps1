@@ -7,7 +7,20 @@ $deps = Get-ChildItem (Join-Path $root 'engine-build/deps') -Directory
 $prefix = @($engine) + ($deps | ForEach-Object { $_.FullName })
 $prefixArg = ($prefix -join ';').Replace('\', '/')
 
-cmake -S $root -B (Join-Path $root 'build') -G 'Visual Studio 18 2026' -A x64 "-DCMAKE_PREFIX_PATH=$prefixArg"
+# NDI SDK headers (NDI License) for the NDI input: taken at build time, pinned, not stored in the repository.
+$ndiCommit = 'fa41b38f18f07acc3c041e382e091a196fc12db0'
+$ndi = Join-Path $root 'engine-build/ndi-sdk'
+if (-not (Test-Path (Join-Path $ndi 'lib/ndi/Processing.NDI.Lib.h'))) {
+    if (Test-Path $ndi) { Remove-Item $ndi -Recurse -Force }
+    git init -q $ndi
+    git -C $ndi remote add origin https://github.com/DistroAV/DistroAV.git
+    git -C $ndi sparse-checkout set lib/ndi
+    git -C $ndi fetch -q --depth 1 --filter=blob:none origin $ndiCommit
+    git -C $ndi checkout -q FETCH_HEAD
+}
+$ndiInclude = (Join-Path $ndi 'lib/ndi').Replace('\', '/')
+
+cmake -S $root -B (Join-Path $root 'build') -G 'Visual Studio 18 2026' -A x64 "-DCMAKE_PREFIX_PATH=$prefixArg" "-DMYOBS_NDI_SDK_DIR=$ndiInclude"
 if ($LASTEXITCODE) { throw 'configure failed' }
 cmake --build (Join-Path $root 'build') --config RelWithDebInfo --parallel
 if ($LASTEXITCODE) { throw 'build failed' }
