@@ -516,7 +516,10 @@ private:
 	void AddDevice(const QString &type, const QString &base)
 	{
 		if (!obs_source_get_display_name(SourceId(type))) {
-			QMessageBox::warning(this, "MyOBS", QString("Модуль входа «%1» не загружен.").arg(TypeTitle(type)));
+			QMessageBox::warning(this, "MyOBS",
+					     type == "decklink"
+						     ? QString("DeckLink недоступен: не установлен драйвер Blackmagic Desktop Video.")
+						     : QString("Модуль входа «%1» не загружен.").arg(TypeTitle(type)));
 			return;
 		}
 		int n = 1;
