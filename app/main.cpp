@@ -91,6 +91,13 @@ QFrame#tile[state="preview"] { border-color: #f28c1e; background: #2a2116; }
 QFrame#tile[state="program"] { border-color: #e0312b; background: #2c1715; }
 QLabel#tileNumber { color: #8a8f97; font-size: 11px; }
 QLabel#tileName { color: #e4e6ea; font-size: 13px; }
+QPushButton#mute { padding: 0; font-size: 10px; font-weight: bold; }
+QPushButton#mute:checked { background: #e0312b; border-color: #e0312b; color: #fff; }
+QSlider::groove:horizontal { height: 4px; background: #33373e; }
+QSlider::handle:horizontal { width: 10px; margin: -5px 0; background: #c9ccd1; }
+QSlider::sub-page:horizontal { background: #8a8f97; }
+QTabBar#inputTabs::tab { background: #1b1d21; color: #c9ccd1; border: 1px solid #2c3036; padding: 4px 14px; margin-right: 2px; }
+QTabBar#inputTabs::tab:selected { background: #2a2e34; border-bottom: 2px solid #f28c1e; }
 )";
 
 /* ---- main window (skeleton) ---- */
@@ -120,6 +127,7 @@ public:
 		root->addLayout(top, 5);
 
 		switcher_ = std::make_unique<myobs::Switcher>();
+		Thumbs::Get().Start();
 		inputs_ = new InputsPanel(switcher_.get(), this);
 		root->addWidget(inputs_, 4);
 
@@ -142,6 +150,7 @@ public:
 		preview_->DestroyDisplay();
 		program_->DestroyDisplay();
 		delete inputs_;
+		Thumbs::Get().Stop();
 		switcher_.reset();
 	}
 
@@ -185,6 +194,7 @@ private:
 				h->SetAspect((double)ovi.base_width / ovi.base_height);
 		preview_->Sync(visible);
 		program_->Sync(visible);
+		inputs_->SyncDisplays(visible);
 
 		const double budget = ovi.fps_num ? 1000.0 * ovi.fps_den / ovi.fps_num : 0.0;
 		const double renderMs = obs_get_average_frame_time_ns() / 1000000.0;

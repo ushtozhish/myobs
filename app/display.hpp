@@ -3,6 +3,7 @@
  * included); Source mode draws one source. */
 #pragma once
 
+#include "thumbs.hpp"
 #include <obs.hpp>
 
 #include <QLabel>
@@ -24,7 +25,7 @@
 
 class SourceDisplay : public QWidget {
 public:
-	enum class Mode { Program, Source };
+	enum class Mode { Program, Source, Thumbnail };
 
 	explicit SourceDisplay(Mode mode, QWidget *parent = nullptr) : QWidget(parent), mode_(mode)
 	{
@@ -167,7 +168,9 @@ private:
 				std::lock_guard<std::mutex> lock(self->mutex_);
 				source = OBSGetStrongRef(self->weak_);
 			}
-			if (source)
+			if (source && self->mode_ == Mode::Thumbnail)
+				Thumbs::Get().Draw(source, ovi.base_width, ovi.base_height);
+			else if (source)
 				obs_source_video_render(source);
 		}
 
