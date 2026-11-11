@@ -5,19 +5,32 @@ namespace myobs {
 Switcher::Switcher()
 {
 	// The Fade transition (obs-transitions plugin) also performs CUT: obs_transition_set swaps instantly.
+	RegisterCoreSources();
 	transition_ = obs_source_create_private("fade_transition", "MyOBS program", nullptr);
 	if (transition_) {
 		signal_handler_connect(obs_source_get_signal_handler(transition_), "transition_stop",
 				       TransitionStopped, this);
-		obs_set_output_source(0, transition_);
+		obs_data_t *s = obs_data_create();
+		obs_data_set_int(s, "target", (long long)(uintptr_t)transition_);
+		proxy_ = obs_source_create_private("myobs_program_proxy", "MyOBS program picture", s);
+		obs_data_release(s);
+		obs_set_output_source(0, proxy_);
+		/* the transition is activated as the proxy's child: inputs on air get activated as usual */
+		obs_source_add_active_child(proxy_, transition_);
 	}
+	bus_ = std::make_unique<AudioBus>();
 	obs_add_tick_callback(TickCallback, this);
 }
 
 Switcher::~Switcher()
 {
 	obs_remove_tick_callback(TickCallback, this);
-	obs_set_output_source(0, nullptr);
+	bus_.reset();
+	if (proxy_) {
+		obs_source_remove_active_child(proxy_, transition_);
+		obs_set_output_source(0, nullptr);
+		obs_source_release(proxy_);
+	}
 	if (transition_) {
 		signal_handler_disconnect(obs_source_get_signal_handler(transition_), "transition_stop",
 					  TransitionStopped, this);
@@ -51,6 +64,8 @@ int Switcher::AddInput(obs_source_t *source, const std::string &name)
 	std::lock_guard<std::mutex> lock(mutex_);
 	scenes_.push_back(scene);
 	names_.push_back(name);
+	sources_.push_back(source);
+	bus_->Add(source, true, true);
 	const int index = (int)scenes_.size() - 1;
 	if (index == 0) {
 		queue_.push_back({Request::Kind::Preview, 0, 0});
@@ -65,8 +80,10 @@ bool Switcher::RemoveInput(int index)
 	if (index < 0 || index >= (int)scenes_.size() || index == program_ || index == fadeTarget_)
 		return false;
 	obs_scene_t *scene = scenes_[index];
+	bus_->Remove(sources_[index]);
 	scenes_.erase(scenes_.begin() + index);
 	names_.erase(names_.begin() + index);
+	sources_.erase(sources_.begin() + index);
 	auto shift = [index](int i) { return i > index ? i - 1 : i; };
 	program_ = shift(program_);
 	preview_ = preview_ == index ? program_.load() : shift(preview_);
@@ -95,6 +112,39 @@ std::string Switcher::InputName(int index) const
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	return index >= 0 && index < (int)names_.size() ? names_[index] : std::string();
+}
+
+bool Switcher::HasAudio(int index) const
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	return index >= 0 && index < (int)sources_.size() &&
+	       (obs_source_get_output_flags(sources_[index]) & OBS_SOURCE_AUDIO) != 0;
+}
+
+void Switcher::SetAudioOnAir(int index, bool onAir)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (index >= 0 && index < (int)sources_.size())
+		bus_->SetOnAir(sources_[index], onAir);
+}
+
+void Switcher::SetAudioAfv(int index, bool afv)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (index >= 0 && index < (int)sources_.size())
+		bus_->SetAfv(sources_[index], afv);
+}
+
+bool Switcher::AudioOnAir(int index) const
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	return index >= 0 && index < (int)sources_.size() && bus_->OnAir(sources_[index]);
+}
+
+bool Switcher::AudioAfv(int index) const
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	return index >= 0 && index < (int)sources_.size() && bus_->Afv(sources_[index]);
 }
 
 obs_source_t *Switcher::InputScene(int index) const
@@ -196,6 +246,7 @@ void Switcher::Tick()
 			const int old = program_;
 			program_ = target;
 			preview_ = old >= 0 ? old : target;
+			bus_->SetPicture(sources_[target], nullptr, 10);
 			Emit(Event::Kind::Cut);
 		} else {
 			fadeTarget_ = target;
@@ -208,8 +259,11 @@ void Switcher::Tick()
 				const int old = program_;
 				program_ = target;
 				preview_ = old;
+				bus_->SetPicture(sources_[target], nullptr, 10);
 				Emit(Event::Kind::Cut);
 			} else {
+				/* AFV sound crossfades with the picture */
+				bus_->SetPicture(sources_[target], nullptr, r.ms);
 				Emit(Event::Kind::FadeStart);
 			}
 		}

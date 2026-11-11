@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -62,12 +63,42 @@ struct Pattern {
 	obs_source_t *source;
 	uint32_t id = 0; /* input number, bits 12-15 of the code */
 	uint32_t counter = 0;
+	float level = 0.0f; /* constant audio level (0 = no sound) */
+	double audioDebt = 0.0;
+	uint64_t audioFrames = 0;
+	uint64_t audioStart = 0;
+	std::vector<float> audio;
 	std::vector<uint8_t> y, u, v;
 };
 
-void PatternTick(void *data, float)
+void PatternAudio(Pattern *p, float seconds)
+{
+	if (p->level == 0.0f)
+		return;
+	if (!p->audioStart)
+		p->audioStart = os_gettime_ns();
+	p->audioDebt += seconds * 48000.0;
+	const uint32_t n = (uint32_t)p->audioDebt;
+	if (!n)
+		return;
+	p->audioDebt -= n;
+	p->audio.assign(n, p->level);
+	obs_source_audio a = {};
+	a.speakers = SPEAKERS_STEREO;
+	a.format = AUDIO_FORMAT_FLOAT_PLANAR;
+	a.samples_per_sec = 48000;
+	a.frames = n;
+	a.data[0] = (const uint8_t *)p->audio.data();
+	a.data[1] = (const uint8_t *)p->audio.data();
+	a.timestamp = p->audioStart + p->audioFrames * 1000000000ULL / 48000;
+	p->audioFrames += n;
+	obs_source_output_audio(p->source, &a);
+}
+
+void PatternTick(void *data, float seconds)
 {
 	auto *p = static_cast<Pattern *>(data);
+	PatternAudio(p, seconds);
 	const int strip = kH / 9, bw = kW / 16;
 	const uint32_t code = ((p->id & 0xF) << 12) | (p->counter & 0xFFF);
 	for (int yy = 0; yy < strip; yy++)
@@ -96,11 +127,12 @@ void RegisterPattern()
 	obs_source_info info = {};
 	info.id = "myobs_test_pattern";
 	info.type = OBS_SOURCE_TYPE_INPUT;
-	info.output_flags = OBS_SOURCE_ASYNC_VIDEO;
+	info.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO;
 	info.get_name = [](void *) { return "Test pattern"; };
 	info.create = [](obs_data_t *settings, obs_source_t *source) -> void * {
 		auto *p = new Pattern{source};
 		p->id = (uint32_t)obs_data_get_int(settings, "id");
+		p->level = (float)obs_data_get_double(settings, "level");
 		p->y.assign((size_t)kW * kH, 128);
 		p->u.assign((size_t)kW * kH / 4, 128);
 		p->v.assign((size_t)kW * kH / 4, 128);
@@ -332,6 +364,87 @@ void RunSwitchScenario(const char *title, bool fades, const std::function<void(m
 	Check(executed == expectedRequests, t + "every click executed exactly once (none lost)");
 }
 
+/* ---- sound on air: «в эфир», AFV, no sound leaking from the picture chain ---- */
+
+std::mutex g_audioMutex;
+std::vector<std::pair<uint64_t, double>> g_audioBlocks; /* (time, mean of channel 0) */
+
+void OnAudio(void *, size_t, audio_data *data)
+{
+	if (!data || !data->data[0] || !data->frames)
+		return;
+	const float *f = (const float *)data->data[0];
+	double sum = 0;
+	for (uint32_t i = 0; i < data->frames; i++)
+		sum += f[i];
+	std::lock_guard<std::mutex> lock(g_audioMutex);
+	g_audioBlocks.push_back({os_gettime_ns(), sum / data->frames});
+}
+
+/* waits for the sound to settle, then the mean level of the last 0.4 s */
+double SettledLevel()
+{
+	std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+	const uint64_t from = os_gettime_ns() - 400000000ULL;
+	std::lock_guard<std::mutex> lock(g_audioMutex);
+	double sum = 0;
+	int n = 0;
+	for (auto &[t, v] : g_audioBlocks)
+		if (t >= from) {
+			sum += v;
+			n++;
+		}
+	return n ? sum / n : -1.0;
+}
+
+obs_source_t *MakeSoundInput(int id, double level)
+{
+	obs_data_t *s = obs_data_create();
+	obs_data_set_int(s, "id", id);
+	obs_data_set_double(s, "level", level);
+	obs_source_t *src = obs_source_create_private("myobs_test_pattern", ("sound " + std::to_string(id)).c_str(), s);
+	obs_data_release(s);
+	return src;
+}
+
+void TestAudio()
+{
+	obs_source_t *in[3] = {MakeSoundInput(1, 0.1), MakeSoundInput(2, 0.2), MakeSoundInput(3, 0.4)};
+	obs_add_raw_audio_callback(0, nullptr, OnAudio, nullptr);
+	{
+		myobs::Switcher sw;
+		for (int i = 0; i < 3; i++)
+			sw.AddInput(in[i], "Sound " + std::to_string(i + 1));
+		auto expect = [](double want, const std::string &what) {
+			const double got = SettledLevel();
+			std::printf("  sound level %.3f (expected %.3f)\n", got, want);
+			Check(std::fabs(got - want) < 0.02, what);
+		};
+		/* defaults: every input «в эфир» with AFV: only the program input sounds */
+		expect(0.1, "sound: AFV - only the input on air sounds (input 1), no sound from the picture chain");
+		sw.SetPreview(1);
+		sw.Cut();
+		expect(0.2, "sound: after CUT the sound follows the picture (input 2)");
+		sw.SetAudioAfv(2, false);
+		expect(0.6, "sound: input 3 without AFV sounds while off air (2 + 3)");
+		sw.SetAudioOnAir(1, false);
+		expect(0.4, "sound: «в эфир» off silences the program input (only 3)");
+		sw.SetAudioOnAir(1, true);
+		sw.SetPreview(0);
+		sw.Fade(300);
+		expect(0.5, "sound: after FADE the AFV sound moved with the picture (1 + 3)");
+		Check(sw.HasAudio(0) && sw.AudioOnAir(0) && sw.AudioAfv(0) && !sw.AudioAfv(2), "sound: input sound state reads back");
+	}
+	{
+		const double got = SettledLevel();
+		std::printf("  sound level after the switcher is gone %.3f\n", got);
+		Check(std::fabs(got) < 0.02, "sound: nothing sounds after the switcher is gone");
+	}
+	obs_remove_raw_audio_callback(0, OnAudio, nullptr);
+	for (obs_source_t *s : in)
+		obs_source_release(s);
+}
+
 void TestRemoveInput()
 {
 	obs_source_t *in[3] = {MakeInput(1), MakeInput(2), MakeInput(3)};
@@ -410,6 +523,7 @@ int main()
 		TestPlugins();
 		TestSwitcher();
 		TestRemoveInput();
+		TestAudio();
 	} else {
 		Check(false, "engine start");
 	}

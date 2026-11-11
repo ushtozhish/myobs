@@ -8,10 +8,13 @@
 
 #include <obs.h>
 
+#include "audiobus.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -40,6 +43,13 @@ public:
 	std::string InputName(int index) const;
 	obs_source_t *InputScene(int index) const; // not referenced; valid while the switcher lives
 
+	// Sound of an input (see audiobus.hpp): «в эфир» and AFV. Inputs without sound ignore it.
+	bool HasAudio(int index) const;
+	void SetAudioOnAir(int index, bool onAir);
+	void SetAudioAfv(int index, bool afv);
+	bool AudioOnAir(int index) const;
+	bool AudioAfv(int index) const;
+
 	// Requests (any thread).
 	void SetPreview(int index);
 	void Cut();
@@ -66,6 +76,9 @@ private:
 	void Emit(Event::Kind kind);
 
 	obs_source_t *transition_ = nullptr;
+	obs_source_t *proxy_ = nullptr; // channel 0: picture of the transition, no sound tree
+	std::unique_ptr<AudioBus> bus_;
+	std::vector<obs_source_t *> sources_; // the inputs themselves (scenes hold the references)
 	std::vector<obs_scene_t *> scenes_;
 	std::vector<std::string> names_;
 	mutable std::mutex mutex_;
