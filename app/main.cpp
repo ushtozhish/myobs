@@ -222,6 +222,12 @@ int main(int argc, char *argv[])
 	ai.speakers = SPEAKERS_STEREO;
 	obs_reset_audio(&ai);
 
+	{ /* our own frontend: tell libobs where the plugins are (next to the exe: ../../obs-plugins/64bit) */
+		char *exeDir = os_get_executable_path_ptr("");
+		std::string base = exeDir ? exeDir : "";
+		bfree(exeDir);
+		obs_add_module_path((base + "../../obs-plugins/64bit").c_str(), (base + "../../data/obs-plugins/%module%").c_str());
+	}
 	obs_load_all_modules();
 	obs_log_loaded_modules();
 	obs_post_load_modules();
