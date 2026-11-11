@@ -2,10 +2,14 @@ name: build
 
 on:
   push:
+    branches: [main]
     paths-ignore:
       - 'README.md'
       - 'docs/**'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   windows:
@@ -47,6 +51,20 @@ jobs:
           Get-ChildItem $out -ErrorAction SilentlyContinue | Format-Table Name, Length
           $log = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'MyOBS/logs') -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1
           if ($log) { Get-Content $log.FullName | Select-Object -Last 40 }
+
+      - name: Publish screenshots to the screenshots branch
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          if (-not (Test-Path screenshots/1_work.png)) { Write-Host 'no screenshots'; exit 0 }
+          Set-Location screenshots
+          git init -q -b screenshots
+          git config user.name 'myobs-ci'
+          git config user.email 'myobs-ci@users.noreply.github.com'
+          git add *.png
+          git commit -q -m "Screenshots of ${{ github.sha }}"
+          git push -q -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" screenshots
 
       - name: Upload screenshots
         if: always()
