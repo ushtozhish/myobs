@@ -314,6 +314,9 @@ public:
 		connect(addDeckLink, &QPushButton::clicked, this, [this]() { AddDevice("decklink", "DeckLink"); });
 		auto *addNdi = new QPushButton("+ NDI", this);
 		connect(addNdi, &QPushButton::clicked, this, [this]() { AddDevice("ndi", "NDI"); });
+		auto *addCall = new QPushButton("+ Звонок", this);
+		addCall->setToolTip("Прямой звонок (VDO.Ninja): гость подключается по ссылке из браузера или телефона");
+		connect(addCall, &QPushButton::clicked, this, [this]() { AddDevice("call", "Звонок"); });
 		connect(addClip, &QPushButton::clicked, this, [this]() { AddClipDialog(); });
 		connect(addImage, &QPushButton::clicked, this, [this]() { AddImageDialog(); });
 		connect(addColor, &QPushButton::clicked, this, [this]() { AddColorDialog(); });
@@ -323,6 +326,7 @@ public:
 		bar->addWidget(addCamera);
 		bar->addWidget(addDeckLink);
 		bar->addWidget(addNdi);
+		bar->addWidget(addCall);
 		bar->addStretch();
 		status_ = new QLabel(this);
 		status_->setObjectName("switchStatus");
@@ -437,6 +441,7 @@ private:
 		       : type == "camera"   ? "Камера"
 		       : type == "decklink" ? "DeckLink"
 		       : type == "ndi"      ? "NDI"
+		       : type == "call"     ? "Звонок"
 					    : type;
 	}
 
@@ -447,6 +452,7 @@ private:
 		       : type == "camera"   ? "dshow_input"
 		       : type == "decklink" ? "decklink-input"
 		       : type == "ndi"      ? "myobs_ndi"
+		       : type == "call"     ? "vdoninja_source"
 					    : "color_source_v3";
 	}
 

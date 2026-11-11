@@ -76,5 +76,5 @@ pwsh ci/run-tests.ps1
 
 ## License
 
-GPL-2.0-or-later. Engine: [OBS Studio](https://github.com/obsproject/obs-studio) (libobs) — thanks to
+GPL-2.0-or-later for the MyOBS code; the calls module (obs-vdoninja, GPL-3.0) makes the distributed program GPL-3.0. Engine: [OBS Studio](https://github.com/obsproject/obs-studio) (libobs) — thanks to
 its authors. Not affiliated with or endorsed by the OBS Project.

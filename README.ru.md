@@ -92,6 +92,6 @@ pwsh ci/run-tests.ps1
 
 ## Лицензия
 
-GPL-2.0-or-later. Движок — [OBS Studio](https://github.com/obsproject/obs-studio) (libobs),
+GPL-2.0-or-later для кода MyOBS; модуль звонков (obs-vdoninja, GPL-3.0) делает распространяемую программу GPL-3.0. Движок — [OBS Studio](https://github.com/obsproject/obs-studio) (libobs),
 спасибо его авторам. Проект не связан с OBS Project и не одобрен им.
 *Not affiliated with or endorsed by the OBS Project.*
