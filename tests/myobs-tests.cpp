@@ -388,9 +388,13 @@ void TestSwitcher()
 
 void TestPlugins()
 {
-	myobs::LoadPlugins({"obs-transitions"}); /* the tests need only transitions + MyOBS plugins */
+	myobs::LoadPlugins({"obs-transitions", "win-dshow", "decklink", "image-source"});
 	const char *name = obs_source_get_display_name("myobs_clip");
 	Check(name != nullptr, "«Клип» input registered (myobs_clip)");
+	Check(obs_source_get_display_name("dshow_input") != nullptr, "camera / capture card input registered (dshow_input)");
+	Check(obs_source_get_display_name("decklink-input") != nullptr, "DeckLink input registered");
+	Check(obs_source_get_display_name("image_source") != nullptr, "image input registered");
+	Check(obs_source_get_display_name("color_source_v3") != nullptr, "colour input registered");
 }
 
 } // namespace

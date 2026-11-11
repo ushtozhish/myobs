@@ -10,6 +10,7 @@
 #include <obs.hpp>
 
 #include "display.hpp"
+#include "props.hpp"
 #include "switcher.hpp"
 #include "thumbs.hpp"
 
@@ -297,12 +298,19 @@ public:
 		auto *addClip = new QPushButton("+ Клип", this);
 		auto *addImage = new QPushButton("+ Картинка", this);
 		auto *addColor = new QPushButton("+ Цвет", this);
+		auto *addCamera = new QPushButton("+ Камера", this);
+		addCamera->setToolTip("Камера или карта захвата (DirectShow)");
+		auto *addDeckLink = new QPushButton("+ DeckLink", this);
+		connect(addCamera, &QPushButton::clicked, this, [this]() { AddDevice("camera", "Камера"); });
+		connect(addDeckLink, &QPushButton::clicked, this, [this]() { AddDevice("decklink", "DeckLink"); });
 		connect(addClip, &QPushButton::clicked, this, [this]() { AddClipDialog(); });
 		connect(addImage, &QPushButton::clicked, this, [this]() { AddImageDialog(); });
 		connect(addColor, &QPushButton::clicked, this, [this]() { AddColorDialog(); });
 		bar->addWidget(addClip);
 		bar->addWidget(addImage);
 		bar->addWidget(addColor);
+		bar->addWidget(addCamera);
+		bar->addWidget(addDeckLink);
 		bar->addStretch();
 		status_ = new QLabel(this);
 		status_->setObjectName("switchStatus");
@@ -409,12 +417,21 @@ private:
 
 	static QString TypeTitle(const QString &type)
 	{
-		return type == "clip" ? "Клип" : type == "image" ? "Картинка" : type == "color" ? "Цвет" : type;
+		return type == "clip"       ? "Клип"
+		       : type == "image"    ? "Картинка"
+		       : type == "color"    ? "Цвет"
+		       : type == "camera"   ? "Камера"
+		       : type == "decklink" ? "DeckLink"
+					    : type;
 	}
 
 	static const char *SourceId(const QString &type)
 	{
-		return type == "clip" ? "myobs_clip" : type == "image" ? "image_source" : "color_source_v3";
+		return type == "clip"       ? "myobs_clip"
+		       : type == "image"    ? "image_source"
+		       : type == "camera"   ? "dshow_input"
+		       : type == "decklink" ? "decklink-input"
+					    : "color_source_v3";
 	}
 
 	int Columns() const { return std::max(1, (width() - 4) / (InputTile::kThumbW + 36)); }
@@ -493,6 +510,46 @@ private:
 		OBSDataAutoRelease s = obs_data_create();
 		SetColor(s, c);
 		Add("color", QString("Цвет %1").arg(c.name()), s, CurrentTab(), 1.0, false);
+	}
+
+	/* Live device input: created, then its settings dialog; Cancel on creation removes it again. */
+	void AddDevice(const QString &type, const QString &base)
+	{
+		if (!obs_source_get_display_name(SourceId(type))) {
+			QMessageBox::warning(this, "MyOBS", QString("Модуль входа «%1» не загружен.").arg(TypeTitle(type)));
+			return;
+		}
+		int n = 1;
+		for (const Input &in : inputs_)
+			if (in.type == type)
+				n++;
+		OBSDataAutoRelease s = obs_data_create();
+		if (!Add(type, QString("%1 %2").arg(base).arg(n), s, CurrentTab(), 1.0, false))
+			return;
+		const int index = (int)inputs_.size() - 1;
+		PropertiesDialog d(inputs_[index].source, QString("Свойства — %1").arg(inputs_[index].name), this);
+		if (d.exec() == QDialog::Accepted) {
+			RefreshAudio(index);
+			RebuildTiles();
+			SaveInputs();
+		} else if (sw_->RemoveInput(index)) {
+			ClearTiles();
+			inputs_.erase(inputs_.begin() + index);
+			RebuildTiles();
+			SaveInputs();
+		}
+	}
+
+	/* A device may get or lose sound after its settings change. */
+	void RefreshAudio(int index)
+	{
+		Input &in = inputs_[index];
+		const bool hasAudio = (obs_source_get_output_flags(in.source) & OBS_SOURCE_AUDIO) != 0;
+		if (hasAudio && !in.audio) {
+			ClearTiles();
+			in.audio = std::make_unique<InputAudio>(in.source);
+			RebuildTiles();
+		}
 	}
 
 	static void SetColor(obs_data_t *s, const QColor &c)
@@ -640,6 +697,14 @@ private:
 			SetColor(s, c);
 			obs_source_update(in.source, s);
 			SaveInputs();
+			return;
+		}
+		if (in.type != "clip" && in.type != "image") {
+			PropertiesDialog pd(in.source, QString("Свойства — %1").arg(in.name), this);
+			if (pd.exec() == QDialog::Accepted) {
+				RefreshAudio(index);
+				SaveInputs();
+			}
 			return;
 		}
 		QDialog d(this);
