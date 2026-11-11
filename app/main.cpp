@@ -38,6 +38,40 @@
 #include "gpu.hpp"
 #endif
 
+/* Our own frontend loads plugins itself: every DLL in obs-plugins/64bit next to the exe. */
+static int LoadPluginsNextToExe()
+{
+	char *exeDir = os_get_executable_path_ptr("");
+	std::string base = exeDir ? exeDir : "";
+	bfree(exeDir);
+	int loaded = 0;
+	os_glob_t *glob = nullptr;
+	if (os_glob((base + "../../obs-plugins/64bit/*.dll").c_str(), 0, &glob) != 0)
+		return 0;
+	for (size_t i = 0; i < glob->gl_pathc; i++) {
+		const char *path = glob->gl_pathv[i].path;
+		std::string file = path;
+		size_t slash = file.find_last_of("/\\");
+		std::string name = file.substr(slash + 1, file.size() - slash - 5);
+		std::string data = base + "../../data/obs-plugins/" + name;
+		obs_module_t *m = nullptr;
+		int r = obs_open_module(&m, path, os_file_exists(data.c_str()) ? data.c_str() : nullptr);
+		if (r != MODULE_SUCCESS) {
+			blog(LOG_WARNING, "plugin %s not opened (%d)", name.c_str(), r);
+			continue;
+		}
+		if (!obs_init_module(m)) {
+			blog(LOG_WARNING, "plugin %s failed to init", name.c_str());
+			continue;
+		}
+		loaded++;
+	}
+	os_globfree(glob);
+	blog(LOG_INFO, "plugins loaded: %d", loaded);
+	return loaded;
+}
+
+
 namespace {
 
 /* ---- log to file ---- */
@@ -199,6 +233,7 @@ int main(int argc, char *argv[])
 	settings.setValue("video/renderGpu", QString::fromStdString(gpu));
 #endif
 
+
 	obs_video_info ovi = {};
 	ovi.graphics_module = "libobs-d3d11";
 	ovi.fps_num = (uint32_t)settings.value("video/fps", 50).toUInt();
@@ -222,13 +257,7 @@ int main(int argc, char *argv[])
 	ai.speakers = SPEAKERS_STEREO;
 	obs_reset_audio(&ai);
 
-	{ /* our own frontend: tell libobs where the plugins are (next to the exe: ../../obs-plugins/64bit) */
-		char *exeDir = os_get_executable_path_ptr("");
-		std::string base = exeDir ? exeDir : "";
-		bfree(exeDir);
-		obs_add_module_path((base + "../../obs-plugins/64bit").c_str(), (base + "../../data/obs-plugins/%module%").c_str());
-	}
-	obs_load_all_modules();
+	LoadPluginsNextToExe();
 	obs_log_loaded_modules();
 	obs_post_load_modules();
 

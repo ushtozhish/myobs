@@ -38,6 +38,39 @@ void Check(bool ok, const std::string &what)
 		g_failures++;
 }
 
+/* Our own frontend loads plugins itself: every DLL in obs-plugins/64bit next to the exe. */
+static int LoadPluginsNextToExe()
+{
+	char *exeDir = os_get_executable_path_ptr("");
+	std::string base = exeDir ? exeDir : "";
+	bfree(exeDir);
+	int loaded = 0;
+	os_glob_t *glob = nullptr;
+	if (os_glob((base + "../../obs-plugins/64bit/*.dll").c_str(), 0, &glob) != 0)
+		return 0;
+	for (size_t i = 0; i < glob->gl_pathc; i++) {
+		const char *path = glob->gl_pathv[i].path;
+		std::string file = path;
+		size_t slash = file.find_last_of("/\\");
+		std::string name = file.substr(slash + 1, file.size() - slash - 5);
+		std::string data = base + "../../data/obs-plugins/" + name;
+		obs_module_t *m = nullptr;
+		int r = obs_open_module(&m, path, os_file_exists(data.c_str()) ? data.c_str() : nullptr);
+		if (r != MODULE_SUCCESS) {
+			blog(LOG_WARNING, "plugin %s not opened (%d)", name.c_str(), r);
+			continue;
+		}
+		if (!obs_init_module(m)) {
+			blog(LOG_WARNING, "plugin %s failed to init", name.c_str());
+			continue;
+		}
+		loaded++;
+	}
+	os_globfree(glob);
+	blog(LOG_INFO, "plugins loaded: %d", loaded);
+	return loaded;
+}
+
 void LogHandler(int level, const char *format, va_list args, void *)
 {
 	if (level > LOG_INFO)
@@ -208,26 +241,10 @@ void TestPipeline()
 
 void TestPlugins()
 {
-	{ /* our own frontend: tell libobs where the plugins are (next to the exe: ../../obs-plugins/64bit) */
-		char *exeDir = os_get_executable_path_ptr("");
-		std::string base = exeDir ? exeDir : "";
-		bfree(exeDir);
-		obs_add_module_path((base + "../../obs-plugins/64bit").c_str(), (base + "../../data/obs-plugins/%module%").c_str());
-	}
-	obs_load_all_modules();
+	LoadPluginsNextToExe();
 	obs_post_load_modules();
 	const char *name = obs_source_get_display_name("myobs_clip");
 	Check(name != nullptr, "«Клип» input registered (myobs_clip)");
-	if (!name) { /* diagnose: open the module directly and report the libobs error code */
-		char *exeDir = os_get_executable_path_ptr("");
-		std::string dll = std::string(exeDir ? exeDir : "") + "../../obs-plugins/64bit/myobs-clip.dll";
-		bfree(exeDir);
-		std::printf("  plugin path: %s (exists: %d)\n", dll.c_str(), (int)os_file_exists(dll.c_str()));
-		obs_module_t *m = nullptr;
-		int r = obs_open_module(&m, dll.c_str(), nullptr);
-		std::printf("  obs_open_module = %d (0 ok, -1 not found/dll deps, -2 missing exports, -3 incompatible)\n", r);
-		if (r == 0) std::printf("  obs_init_module = %d\n", (int)obs_init_module(m));
-	}
 }
 
 } // namespace
