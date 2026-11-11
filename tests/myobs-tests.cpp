@@ -16,6 +16,8 @@
 #include <util/base.h>
 #include <util/platform.h>
 
+#include "plugins.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
@@ -41,39 +43,6 @@ void Check(bool ok, const std::string &what)
 	std::fflush(stdout);
 	if (!ok)
 		g_failures++;
-}
-
-/* Our own frontend loads plugins itself: every DLL in obs-plugins/64bit next to the exe. */
-static int LoadPluginsNextToExe()
-{
-	char *exeDir = os_get_executable_path_ptr("");
-	std::string base = exeDir ? exeDir : "";
-	bfree(exeDir);
-	int loaded = 0;
-	os_glob_t *glob = nullptr;
-	if (os_glob((base + "../../obs-plugins/64bit/*.dll").c_str(), 0, &glob) != 0)
-		return 0;
-	for (size_t i = 0; i < glob->gl_pathc; i++) {
-		const char *path = glob->gl_pathv[i].path;
-		std::string file = path;
-		size_t slash = file.find_last_of("/\\");
-		std::string name = file.substr(slash + 1, file.size() - slash - 5);
-		std::string data = base + "../../data/obs-plugins/" + name;
-		obs_module_t *m = nullptr;
-		int r = obs_open_module(&m, path, os_file_exists(data.c_str()) ? data.c_str() : nullptr);
-		if (r != MODULE_SUCCESS) {
-			blog(LOG_WARNING, "plugin %s not opened (%d)", name.c_str(), r);
-			continue;
-		}
-		if (!obs_init_module(m)) {
-			blog(LOG_WARNING, "plugin %s failed to init", name.c_str());
-			continue;
-		}
-		loaded++;
-	}
-	os_globfree(glob);
-	blog(LOG_INFO, "plugins loaded: %d", loaded);
-	return loaded;
 }
 
 void LogHandler(int level, const char *format, va_list args, void *)
@@ -400,8 +369,7 @@ void TestSwitcher()
 
 void TestPlugins()
 {
-	LoadPluginsNextToExe();
-	obs_post_load_modules();
+	myobs::LoadPlugins();
 	const char *name = obs_source_get_display_name("myobs_clip");
 	Check(name != nullptr, "«Клип» input registered (myobs_clip)");
 }
