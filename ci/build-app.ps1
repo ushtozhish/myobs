@@ -32,4 +32,12 @@ if (Test-Path $windeployqt) {
     New-Item -ItemType Directory -Force -Path (Join-Path $runtime 'bin/64bit/platforms') | Out-Null
     Copy-Item (Join-Path $qt.FullName 'plugins/platforms/qwindows.dll') (Join-Path $runtime 'bin/64bit/platforms')
 }
+# runtime DLLs of the engine dependencies (FFmpeg, zlib, x264...) - OBS copies them in its own build, we do it here
+$bin = Join-Path $runtime 'bin/64bit'
+foreach ($d in $deps) {
+    if ($d.Name -like 'obs-deps-qt6-*') { continue }
+    $db = Join-Path $d.FullName 'bin'
+    if (Test-Path $db) { Get-ChildItem $db -Filter *.dll | ForEach-Object { if (-not (Test-Path (Join-Path $bin $_.Name))) { Copy-Item $_.FullName $bin } } }
+}
+Get-ChildItem $bin -Filter *.dll | ForEach-Object { $_.Name } | Sort-Object | Write-Host
 Write-Host 'MyOBS assembled in runtime/'
