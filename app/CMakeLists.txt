@@ -1,0 +1,3 @@
+add_executable(myobs WIN32 main.cpp gpu.hpp display.hpp)
+target_link_libraries(myobs PRIVATE OBS::libobs Qt6::Widgets)
+install(TARGETS myobs RUNTIME DESTINATION ${MYOBS_BIN_DIR})

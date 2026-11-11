@@ -1,0 +1,50 @@
+diff --git a/libobs/obs-source.c b/libobs/obs-source.c
+index 6785d68..cbb2ef4 100644
+--- a/libobs/obs-source.c
++++ b/libobs/obs-source.c
+@@ -1368,25 +1368,37 @@ static void async_tick(obs_source_t *source)
+ 
+ 	pthread_mutex_lock(&source->async_mutex);
+ 
++	/* MyOBS: a frame that was never drawn (the source was not on screen during its tick)
++	 * used to be thrown away here, so a source that sends frames rarely — a paused clip —
++	 * could show an old or empty picture when it appeared. When nothing newer has arrived,
++	 * the undrawn frame is now kept until it is drawn. Sources drawn every frame are not
++	 * affected (drawing takes cur_async_frame). */
++	bool kept = false;
++
+ 	if (deinterlacing_enabled(source)) {
+ 		deinterlace_process_last_frame(source, sys_time);
+ 	} else {
+-		if (source->cur_async_frame) {
+-			remove_async_frame(source, source->cur_async_frame);
+-			source->cur_async_frame = NULL;
+-		}
++		kept = source->cur_async_frame && !source->async_frames.num;
++		if (!kept) {
++			if (source->cur_async_frame) {
++				remove_async_frame(source, source->cur_async_frame);
++				source->cur_async_frame = NULL;
++			}
+ 
+-		source->cur_async_frame = get_closest_frame(source, sys_time);
++			source->cur_async_frame = get_closest_frame(source, sys_time);
++		}
+ 	}
+ 
+ 	source->last_sys_timestamp = sys_time;
+ 
+ 	if (deinterlacing_enabled(source))
+ 		filter_frame(source, &source->prev_async_frame);
+-	filter_frame(source, &source->cur_async_frame);
++	if (!kept) {
++		filter_frame(source, &source->cur_async_frame);
+ 
+-	if (source->cur_async_frame)
+-		source->async_update_texture = set_async_texture_size(source, source->cur_async_frame);
++		if (source->cur_async_frame)
++			source->async_update_texture = set_async_texture_size(source, source->cur_async_frame);
++	}
+ 
+ 	pthread_mutex_unlock(&source->async_mutex);
+ }

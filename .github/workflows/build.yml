@@ -1,0 +1,43 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Engine from cache
+        id: engine
+        uses: actions/cache@v4
+        with:
+          path: |
+            engine-build/install
+            engine-build/deps
+          key: engine-${{ hashFiles('engine/OBS_VERSION', 'engine/patches/**', 'ci/build-engine.ps1') }}
+
+      - name: Build engine (OBS core, once per engine change)
+        if: steps.engine.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: ./ci/build-engine.ps1
+
+      - name: Build MyOBS
+        shell: pwsh
+        run: ./ci/build-app.ps1
+
+      - name: Automatic tests
+        shell: pwsh
+        run: ./ci/run-tests.ps1
+
+      - name: Upload MyOBS
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: myobs-windows
+          path: runtime/
+          retention-days: 7
+          if-no-files-found: ignore
