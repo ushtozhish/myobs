@@ -144,7 +144,10 @@ class InputTile : public QFrame {
 public:
 	static constexpr int kThumbW = 208, kThumbH = 117;
 
-	InputTile(int index, obs_source_t *scene, bool hasAudio, QWidget *parent) : QFrame(parent), index_(index)
+	InputTile(int index, obs_source_t *scene, bool hasAudio, QWidget *parent)
+		: QFrame(parent),
+		  index_(index),
+		  scene_(scene)
 	{
 		setObjectName("tile");
 		setCursor(Qt::PointingHandCursor);
@@ -207,6 +210,8 @@ public:
 	}
 
 	void Sync(bool visible) { thumb_->Sync(visible); }
+	QWidget *Thumb() const { return thumb_; }
+	obs_source_t *Scene() const { return scene_; }
 	QSlider *Fader() const { return fader_; }
 	QPushButton *Mute() const { return mute_; }
 	MeterBar *Meter() const { return meter_; }
@@ -250,6 +255,7 @@ protected:
 
 private:
 	int index_;
+	obs_source_t *scene_;
 	SourceDisplay *thumb_ = nullptr;
 	QLabel *number_ = nullptr;
 	QLabel *name_ = nullptr;
@@ -356,6 +362,21 @@ public:
 		}
 		const size_t pending = sw_->PendingRequests();
 		status_->setText(sw_->Transitioning() ? "переход…" : pending ? QString("в очереди: %1").arg(pending) : "");
+	}
+
+	/* Demo / screenshots: tile thumbnail widgets with their scenes; select a tab by name. */
+	std::vector<std::pair<QWidget *, obs_source_t *>> ThumbTargets() const
+	{
+		std::vector<std::pair<QWidget *, obs_source_t *>> out;
+		for (InputTile *t : tiles_)
+			out.push_back({t->Thumb(), t->Scene()});
+		return out;
+	}
+	void SelectTab(const QString &name)
+	{
+		for (int i = 0; i < tabs_->count(); i++)
+			if (tabs_->tabText(i) == name)
+				tabs_->setCurrentIndex(i);
 	}
 
 	/* Window timer, 2 Hz: keep tile displays bound to their windows. */

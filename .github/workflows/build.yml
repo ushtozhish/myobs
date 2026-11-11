@@ -36,6 +36,27 @@ jobs:
         shell: pwsh
         run: ./ci/run-tests.ps1
 
+      - name: Demo screenshots
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = Join-Path $PWD 'screenshots'
+          $exe = Join-Path $PWD 'runtime/bin/64bit/myobs.exe'
+          $p = Start-Process -FilePath $exe -ArgumentList '--demo-screenshots', "`"$out`"" -WorkingDirectory (Split-Path $exe) -PassThru
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); Write-Host 'demo timed out' }
+          Get-ChildItem $out -ErrorAction SilentlyContinue | Format-Table Name, Length
+          $log = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'MyOBS/logs') -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1
+          if ($log) { Get-Content $log.FullName | Select-Object -Last 40 }
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshots/*.png
+          retention-days: 7
+          if-no-files-found: ignore
+
       - name: Upload MyOBS
         if: always()
         uses: actions/upload-artifact@v4

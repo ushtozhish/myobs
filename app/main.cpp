@@ -14,6 +14,7 @@
 #include "plugins.hpp"
 #include "switcher.hpp"
 #include "inputs.hpp"
+#include "demo.hpp"
 
 #include <QApplication>
 #include <QDateTime>
@@ -154,6 +155,30 @@ public:
 		switcher_.reset();
 	}
 
+public:
+	/* --demo-screenshots: a short switching scenario with screenshots, then quit. */
+	void RunDemo(const QString &dir)
+	{
+		auto shot = [this, dir](const QString &name) {
+			QApplication::processEvents();
+			auto targets = inputs_->ThumbTargets();
+			targets.push_back({preview_, switcher_->InputScene(switcher_->Preview())});
+			const QImage img = demo::Shot(this, targets, true, program_);
+			img.save(dir + "/" + name);
+			blog(LOG_INFO, "demo screenshot %s", name.toUtf8().constData());
+		};
+		QTimer::singleShot(2000, this, [this]() { switcher_->SetPreview(1); });
+		QTimer::singleShot(3000, this, [shot]() { shot("1_work.png"); });
+		QTimer::singleShot(3200, this, [this]() { switcher_->Fade(2000); });
+		QTimer::singleShot(4200, this, [shot]() { shot("2_fade.png"); });
+		QTimer::singleShot(6000, this, [this]() {
+			inputs_->SelectTab("Камеры");
+			switcher_->SetPreview(2);
+		});
+		QTimer::singleShot(7000, this, [shot]() { shot("3_tab_cameras.png"); });
+		QTimer::singleShot(7500, this, []() { QApplication::quit(); });
+	}
+
 private:
 	void RefreshSwitch()
 	{
@@ -241,8 +266,14 @@ int main(int argc, char *argv[])
 {
 	QApplication app(argc, argv);
 	QApplication::setApplicationName("MyOBS");
-	QApplication::setOrganizationName("MyOBS");
+	QString demoDir;
+	for (int i = 1; i + 1 < argc; i++)
+		if (QString(argv[i]) == "--demo-screenshots")
+			demoDir = QString::fromLocal8Bit(argv[i + 1]);
+	QApplication::setOrganizationName(demoDir.isEmpty() ? "MyOBS" : "MyOBS-demo");
 	OpenLog();
+	if (!demoDir.isEmpty())
+		demo::Prepare(QDir(demoDir).absolutePath());
 
 	if (!obs_startup("ru-RU", nullptr, nullptr)) {
 		QMessageBox::critical(nullptr, "MyOBS", "Движок не запустился.");
@@ -287,6 +318,10 @@ int main(int argc, char *argv[])
 	int result = 0;
 	{
 		auto window = std::make_unique<MainWindow>(gpu);
+		if (!demoDir.isEmpty()) {
+			window->resize(1600, 980);
+			window->RunDemo(QDir(demoDir).absolutePath());
+		}
 		window->show();
 		result = app.exec();
 	} /* displays go before the engine */
