@@ -82,15 +82,49 @@ pwsh ci/build-app.ps1
 pwsh ci/run-tests.ps1
 ```
 
+## Как делается
+
+Программа пишется с помощью **[Claude Code](https://claude.com/claude-code)** — ИИ-агента Anthropic
+для разработки, модель **Claude Opus 5.5**, уровень рассуждения «средний». Человек ставит задачи,
+проверяет этапы на живом оборудовании и принимает решения; код, тесты и автосборку пишет Claude.
+
 ## English
 
-**MyOBS** is an open-source Windows live production switcher in the spirit of vMix, built on the OBS
-engine (libobs) as a library, with its own interface, frame-accurate switching, an editing-style clip
-player (frame pulled by number on every tick — no blank or stale frames on take), a standard H.264
-working codec, audio buses, triggers and multistreaming. Work in progress; images above are interface
-concepts.
+**MyOBS** is an open-source live production switcher for Windows in the spirit of vMix, built on the
+OBS engine (libobs) used as a library. The interface, switcher, clip playback, audio and triggers are
+its own. *Work in progress (stage 1 of 5); the images above are interface concepts, not screenshots.*
+
+**Why.** OBS is great for a single streamer, but a multi-camera show with clips, calls and LED screens
+runs into its design. We measured it: on every take of a regular video clip OBS puts a blank frame on
+air. MyOBS is built differently:
+
+- **The program output comes first.** Thumbnails, multiview and screens get whatever is left of the frame budget.
+- **Clips like in an editor.** On every output tick a clip hands over the frame *by number* from a
+  pre-decoded buffer, so a blank or foreign frame cannot happen. Pause means the number stops growing:
+  a clip resumes exactly where it left the air (vMix behaviour).
+- **Frame-accurate switching.** CUT, fade and Merge happen on a frame boundary; a click during a transition is queued, not lost.
+- **Standard working codec: H.264** (key frame every 10 frames, no B-frames) — instant seeking, NVIDIA hardware decoding, no third-party codecs.
+- **Audio on the same frame clock** as video, so it never drifts after pauses or seeks.
+- **Discrete GPU only** for rendering, even when the main monitor is on the integrated one.
+
+**Planned:** Preview/Program with CUT, Fade, Merge and stingers; inputs (clip, camera, DeckLink, NDI,
+image, browser, WebRTC calls, compositions — each input is a layered scene); vMix-style tiles with live
+thumbnails, audio meter/fader, overlay buttons and record; colour-coded tabs; audio buses Master/A/B,
+PFL, audio-follows-video, noise suppression, gate and echo cancellation for calls; 4 overlay channels;
+any source to any monitor or LED wall; vMix-style triggers; multistreaming (YouTube and Telegram via API,
+Instagram and TikTok by key) with a merged chat; crash-safe recorder; 16:9 or 9:16 projects; colour
+correction (lift/gamma/gain/offset, curves, LUT), keying, deinterlacing; hotkeys and OSC for every
+function; load monitor and input analytics; MyOBS Encoder — a separate background transcoder.
+
+**Testing.** Every stage is gated by automatic tests: each test frame carries its own number, and every
+frame of the program output is checked for flashes, order and pauses.
+
+**Made with [Claude Code](https://claude.com/claude-code)** (Anthropic), model Claude Opus 5.5, medium
+reasoning effort. A human sets the goals, tests each stage on real broadcast hardware and makes the
+decisions; Claude writes the code, the tests and the CI.
 
 ## Лицензия
 
 GPL-2.0-or-later. Движок — [OBS Studio](https://github.com/obsproject/obs-studio) (libobs),
 спасибо его авторам. Проект не связан с OBS Project и не одобрен им.
+*Not affiliated with or endorsed by the OBS Project.*
