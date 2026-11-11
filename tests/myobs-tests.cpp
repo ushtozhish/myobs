@@ -369,7 +369,7 @@ void TestSwitcher()
 
 void TestPlugins()
 {
-	myobs::LoadPlugins();
+	myobs::LoadPlugins({"obs-transitions"}); /* the tests need only transitions + MyOBS plugins */
 	const char *name = obs_source_get_display_name("myobs_clip");
 	Check(name != nullptr, "«Клип» input registered (myobs_clip)");
 }

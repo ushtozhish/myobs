@@ -3,6 +3,7 @@
 #include <obs.h>
 #include <util/platform.h>
 
+#include <algorithm>
 #include <string>
 
 namespace myobs {
@@ -12,6 +13,7 @@ bool LoadOne(const std::string &dll, const std::string &data, const std::string 
 {
 	if (!os_file_exists(dll.c_str()))
 		return false;
+	blog(LOG_INFO, "loading plugin %s", name.c_str());
 	obs_module_t *m = nullptr;
 	const int r = obs_open_module(&m, dll.c_str(), os_file_exists(data.c_str()) ? data.c_str() : nullptr);
 	if (r != MODULE_SUCCESS) {
@@ -36,7 +38,17 @@ std::string Stem(const char *path)
 
 } // namespace
 
-int LoadPlugins()
+const std::vector<std::string> &DefaultCorePlugins()
+{
+	static const std::vector<std::string> list = {
+		"obs-transitions", "obs-filters", "image-source", "obs-ffmpeg", "obs-outputs", "rtmp-services",
+		"obs-x264",        "obs-nvenc",   "win-wasapi",   "win-dshow",  "decklink",    "text-freetype2",
+		"obs-text",
+	};
+	return list;
+}
+
+int LoadPlugins(const std::vector<std::string> &corePlugins)
 {
 	char *exeDir = os_get_executable_path_ptr("");
 	const std::string base = exeDir ? exeDir : "";
@@ -50,6 +62,8 @@ int LoadPlugins()
 				continue;
 			const std::string dir = glob->gl_pathv[i].path;
 			const std::string name = Stem(dir.c_str());
+			if (std::find(corePlugins.begin(), corePlugins.end(), name) == corePlugins.end())
+				continue;
 			if (LoadOne(dir + "/" + name + ".dll", dir + "/data", name))
 				loaded++;
 		}
