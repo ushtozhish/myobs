@@ -1,7 +1,7 @@
 // MyOBS switcher core: Preview / Program, CUT and Fade on a frame boundary.
 //
 // Every input is a scene (an input can hold layers). The program output (channel 0) is one transition
-// source. UI calls (Cut, Fade, SetPreview) only enqueue requests; they are executed in the engine's
+// source (ProgramMix, our own CUT / FADE). UI calls (Cut, Fade, SetPreview) only enqueue requests; they are executed in the engine's
 // tick, before the frame is rendered, one request per frame. A click during a running fade is kept in
 // the queue and executed when the fade ends - never lost, never mixed into the running transition.
 #pragma once
@@ -9,6 +9,7 @@
 #include <obs.h>
 
 #include "audiobus.hpp"
+#include "program.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -71,12 +72,10 @@ private:
 		uint32_t ms;
 	};
 	static void TickCallback(void *data, float seconds);
-	static void TransitionStopped(void *data, calldata_t *cd);
 	void Tick();
 	void Emit(Event::Kind kind);
 
-	obs_source_t *transition_ = nullptr;
-	obs_source_t *proxy_ = nullptr; // channel 0: picture of the transition, no sound tree
+	std::unique_ptr<ProgramMix> mix_; // channel 0: the program picture
 	std::unique_ptr<AudioBus> bus_;
 	std::vector<obs_source_t *> sources_; // the inputs themselves (scenes hold the references)
 	std::vector<obs_scene_t *> scenes_;
@@ -87,7 +86,6 @@ private:
 	std::atomic<int> program_{-1};
 	std::atomic<int> preview_{-1};
 	std::atomic<bool> transitioning_{false};
-	std::atomic<bool> stopped_{false};
 	int fadeTarget_ = -1;
 	uint64_t frame_ = 0;
 };

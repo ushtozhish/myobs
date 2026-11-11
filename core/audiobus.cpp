@@ -8,40 +8,6 @@
 namespace myobs {
 namespace {
 
-/* ---- video-only proxy of a source (program picture without its sound tree) ---- */
-
-struct Proxy {
-	obs_source_t *self;
-	obs_source_t *target = nullptr; /* not referenced: the owner keeps it alive */
-};
-
-void RegisterProxy()
-{
-	obs_source_info info = {};
-	info.id = "myobs_program_proxy";
-	info.type = OBS_SOURCE_TYPE_INPUT;
-	info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_CAP_DISABLED;
-	info.get_name = [](void *) { return "MyOBS program picture"; };
-	info.create = [](obs_data_t *settings, obs_source_t *source) -> void * {
-		return new Proxy{source, reinterpret_cast<obs_source_t *>((uintptr_t)obs_data_get_int(settings, "target"))};
-	};
-	info.destroy = [](void *data) { delete static_cast<Proxy *>(data); };
-	info.get_width = [](void *) -> uint32_t {
-		obs_video_info ovi = {};
-		return obs_get_video_info(&ovi) ? ovi.base_width : 0;
-	};
-	info.get_height = [](void *) -> uint32_t {
-		obs_video_info ovi = {};
-		return obs_get_video_info(&ovi) ? ovi.base_height : 0;
-	};
-	info.video_render = [](void *data, gs_effect_t *) {
-		auto *p = static_cast<Proxy *>(data);
-		if (p->target)
-			obs_source_video_render(p->target);
-	};
-	obs_register_source(&info);
-}
-
 /* ---- audio bus source ---- */
 
 /* Link between the bus source and its AudioBus: the source can outlive the AudioBus by a tick
@@ -56,7 +22,8 @@ void RegisterBus()
 	obs_source_info info = {};
 	info.id = "myobs_audio_bus";
 	info.type = OBS_SOURCE_TYPE_INPUT;
-	info.output_flags = OBS_SOURCE_AUDIO | OBS_SOURCE_COMPOSITE | OBS_SOURCE_CAP_DISABLED;
+	/* composite with audio_render (libobs refuses COMPOSITE together with the AUDIO flag) */
+	info.output_flags = OBS_SOURCE_COMPOSITE | OBS_SOURCE_CAP_DISABLED;
 	info.get_name = [](void *) { return "MyOBS audio bus"; };
 	/* the link comes in the settings as a pointer value; the source owns it */
 	info.create = [](obs_data_t *settings, obs_source_t *) -> void * {
@@ -86,7 +53,6 @@ void RegisterCoreSources()
 	if (done)
 		return;
 	done = true;
-	RegisterProxy();
 	RegisterBus();
 }
 

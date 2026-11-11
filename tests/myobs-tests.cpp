@@ -466,10 +466,6 @@ void TestRemoveInput()
 
 void TestSwitcher()
 {
-	if (!obs_source_get_display_name("fade_transition")) {
-		Check(false, "fade transition available (obs-transitions plugin)");
-		return;
-	}
 	/* 1. Steady CUTs: one every 4-8 frames. */
 	RunSwitchScenario("cut steady", false, [](myobs::Switcher &sw, std::mt19937 &rng) {
 		for (int i = 0; i < 40; i++) {

@@ -3,9 +3,8 @@
 // libobs mixes into the output the sound of the sources in the output channels and of everything
 // their active trees enumerate; a source met in two trees is mixed on its own, bypassing both.
 // So the picture and the sound are split:
-//   * channel 0 holds a video-only proxy of the program transition. It enumerates nothing, so the
-//     video chain (transition, scenes, inputs) adds no sound; the transition is still activated as
-//     its child, so inputs on air are activated as usual (clips play, cameras run).
+//   * channel 0 holds the program picture (ProgramMix). It enumerates nothing, so the video chain
+//     adds no sound; inputs on air are activated as its active children (clips play, cameras run).
 //   * channel 1 holds the audio bus: a composite audio source that mixes the inputs whose sound is
 //     on air. Each input: «в эфир» (on/off) and AFV (sound only while its picture is on air).
 //     Gains change with a short ramp (no clicks); with AFV a FADE fades the sound with the picture.

@@ -4,20 +4,7 @@ namespace myobs {
 
 Switcher::Switcher()
 {
-	// The Fade transition (obs-transitions plugin) also performs CUT: obs_transition_set swaps instantly.
-	RegisterCoreSources();
-	transition_ = obs_source_create_private("fade_transition", "MyOBS program", nullptr);
-	if (transition_) {
-		signal_handler_connect(obs_source_get_signal_handler(transition_), "transition_stop",
-				       TransitionStopped, this);
-		obs_data_t *s = obs_data_create();
-		obs_data_set_int(s, "target", (long long)(uintptr_t)transition_);
-		proxy_ = obs_source_create_private("myobs_program_proxy", "MyOBS program picture", s);
-		obs_data_release(s);
-		obs_set_output_source(0, proxy_);
-		/* the transition is activated as the proxy's child: inputs on air get activated as usual */
-		obs_source_add_active_child(proxy_, transition_);
-	}
+	mix_ = std::make_unique<ProgramMix>();
 	bus_ = std::make_unique<AudioBus>();
 	obs_add_tick_callback(TickCallback, this);
 }
@@ -26,16 +13,7 @@ Switcher::~Switcher()
 {
 	obs_remove_tick_callback(TickCallback, this);
 	bus_.reset();
-	if (proxy_) {
-		obs_source_remove_active_child(proxy_, transition_);
-		obs_set_output_source(0, nullptr);
-		obs_source_release(proxy_);
-	}
-	if (transition_) {
-		signal_handler_disconnect(obs_source_get_signal_handler(transition_), "transition_stop",
-					  TransitionStopped, this);
-		obs_source_release(transition_);
-	}
+	mix_.reset();
 	for (obs_scene_t *s : scenes_) {
 		obs_source_dec_showing(obs_scene_get_source(s));
 		obs_scene_release(s);
@@ -188,11 +166,6 @@ void Switcher::TickCallback(void *data, float)
 	static_cast<Switcher *>(data)->Tick();
 }
 
-void Switcher::TransitionStopped(void *data, calldata_t *)
-{
-	static_cast<Switcher *>(data)->stopped_ = true;
-}
-
 void Switcher::Emit(Event::Kind kind)
 {
 	if (onEvent_)
@@ -204,70 +177,56 @@ void Switcher::Tick()
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	frame_++;
-	if (!transition_)
-		return;
 
-	if (transitioning_ && stopped_) {
-		// Fade finished: the former preview is on air, the former program goes to preview (vMix).
+	if (transitioning_) {
+		if (!mix_->Advance())
+			return; /* fade running: requests wait */
+		/* Fade finished: the former preview is on air, the former program goes to preview (vMix). */
 		transitioning_ = false;
-		stopped_ = false;
 		const int old = program_;
 		program_ = fadeTarget_;
 		preview_ = old;
 		fadeTarget_ = -1;
 		Emit(Event::Kind::FadeEnd);
-		return; // the fade end takes this frame; the next request runs on the next one
+		return; /* the fade end takes this frame; the next request runs on the next one */
 	}
 
-	// Preview changes are allowed during a fade only for inputs not involved in it.
 	while (!queue_.empty()) {
 		Request r = queue_.front();
-		if (r.kind == Request::Kind::Preview) {
-			if (r.index < 0 || r.index >= (int)scenes_.size()) {
-				queue_.pop_front();
-				continue;
-			}
-			if (transitioning_)
-				break; // keep order: preview after the queued fade/cut
-			queue_.pop_front();
-			preview_ = r.index;
-			Emit(Event::Kind::Preview);
-			continue; // preview is not visible on air, it does not use up the frame
-		}
-		if (transitioning_)
-			break;
 		queue_.pop_front();
+		if (r.kind == Request::Kind::Preview) {
+			if (r.index >= 0 && r.index < (int)scenes_.size()) {
+				preview_ = r.index;
+				Emit(Event::Kind::Preview);
+			}
+			continue; /* preview is not on air, it does not use up the frame */
+		}
 		const int target = preview_;
 		if (target < 0 || target >= (int)scenes_.size())
 			continue;
 		obs_source_t *scene = obs_scene_get_source(scenes_[target]);
-		if (r.kind == Request::Kind::Cut || program_ < 0) {
-			obs_transition_set(transition_, scene);
+		uint32_t frames = 0;
+		if (r.kind == Request::Kind::Fade && program_ >= 0 && target != program_) {
+			obs_video_info ovi = {};
+			if (obs_get_video_info(&ovi) && ovi.fps_den)
+				frames = (uint32_t)((uint64_t)r.ms * ovi.fps_num / (1000ull * ovi.fps_den));
+		}
+		if (frames == 0) {
+			mix_->Cut(scene);
 			const int old = program_;
 			program_ = target;
 			preview_ = old >= 0 ? old : target;
 			bus_->SetPicture(sources_[target], nullptr, 10);
 			Emit(Event::Kind::Cut);
 		} else {
+			mix_->StartFade(scene, frames);
 			fadeTarget_ = target;
-			stopped_ = false;
 			transitioning_ = true;
-			if (!obs_transition_start(transition_, OBS_TRANSITION_MODE_AUTO, r.ms, scene)) {
-				// Could not start (should not happen): fall back to a clean cut.
-				transitioning_ = false;
-				obs_transition_set(transition_, scene);
-				const int old = program_;
-				program_ = target;
-				preview_ = old;
-				bus_->SetPicture(sources_[target], nullptr, 10);
-				Emit(Event::Kind::Cut);
-			} else {
-				/* AFV sound crossfades with the picture */
-				bus_->SetPicture(sources_[target], nullptr, r.ms);
-				Emit(Event::Kind::FadeStart);
-			}
+			/* AFV sound crossfades with the picture */
+			bus_->SetPicture(sources_[target], nullptr, r.ms);
+			Emit(Event::Kind::FadeStart);
 		}
-		break; // one on-air change per frame
+		break; /* one on-air change per frame */
 	}
 }
 
