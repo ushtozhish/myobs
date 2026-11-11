@@ -53,6 +53,7 @@ void LogHandler(int level, const char *format, va_list args, void *)
 	char buf[4096];
 	std::vsnprintf(buf, sizeof(buf), format, args);
 	std::printf("  obs: %s\n", buf);
+	std::fflush(stdout); /* keep the log when a plugin crashes the process */
 }
 
 constexpr uint32_t kW = 640, kH = 360;

@@ -2244,7 +2244,9 @@ bool obs_module_load(void)
 		registerVdoNinjaService();
 		logInfo("Registered VDO.Ninja service");
 
-		try {
+		// MyOBS: the Studio dock and Tools menu exist only inside the OBS frontend; MyOBS has its own
+		// interface (and the automatic tests run without any Qt application).
+		if (obs_frontend_get_main_window()) try {
 			g_vdo_dock = new VDONinjaDock();
 			if (obs_frontend_add_custom_qdock("VDONinjaStudioDock", g_vdo_dock.data())) {
 				logInfo("Registered VDO.Ninja Studio Dock");
@@ -2263,7 +2265,8 @@ bool obs_module_load(void)
 			logError("Failed to create VDO.Ninja Studio Dock: unknown exception");
 		}
 
-		obs_frontend_add_tools_menu_item(tr("Tools.OpenStudio", "VDO.Ninja Studio"), open_vdoninja_studio_callback,
+		if (obs_frontend_get_main_window())
+			obs_frontend_add_tools_menu_item(tr("Tools.OpenStudio", "VDO.Ninja Studio"), open_vdoninja_studio_callback,
 		                                 nullptr);
 		logInfo("Registered VDO.Ninja Studio tools menu action");
 		obs_frontend_add_event_callback(frontend_event_callback, nullptr);
