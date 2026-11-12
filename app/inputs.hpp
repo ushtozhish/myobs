@@ -17,6 +17,10 @@
 #include "props.hpp"
 #include "switcher.hpp"
 #include "thumbs.hpp"
+#include "triggers_ui.hpp"
+
+#include <QGuiApplication>
+#include <QScreen>
 
 #include <QAction>
 #include <QActionGroup>
@@ -674,6 +678,7 @@ private:
 		QMenu menu(this);
 		QAction *props = menu.addAction("Свойства…");
 		QAction *rename = menu.addAction("Переименовать…");
+		QAction *trig = menu.addAction("Триггеры…");
 		QMenu *tabMenu = menu.addMenu("Вкладка");
 		auto *group = new QActionGroup(tabMenu);
 		QAction *none = tabMenu->addAction("Без вкладки");
@@ -697,6 +702,8 @@ private:
 			return;
 		if (chosen == props) {
 			Properties(index);
+		} else if (chosen == trig) {
+			EditTriggers(index);
 		} else if (chosen == rename) {
 			Rename(index);
 		} else if (chosen == remove) {
@@ -810,6 +817,41 @@ private:
 		ClearTiles(); /* tiles use the input's audio and display: drop them first */
 		inputs_.erase(inputs_.begin() + index);
 		RebuildTiles();
+		SaveInputs();
+	}
+
+	/* ---- triggers ---- */
+
+	std::vector<triggersui::InputRef> InputRefs() const
+	{
+		std::vector<triggersui::InputRef> refs;
+		for (int i = 0; i < (int)inputs_.size(); i++)
+			refs.push_back({inputs_[i].name, sw_->InputSource(i)});
+		return refs;
+	}
+
+	/* screens for «Экран: показать» and screen outputs: (id, title) */
+	static std::vector<std::pair<QString, QString>> ScreenList()
+	{
+		std::vector<std::pair<QString, QString>> out;
+		const auto screens = QGuiApplication::screens();
+		for (int i = 0; i < screens.size(); i++) {
+			QScreen *sc = screens[i];
+			out.push_back({sc->name(), QString("Экран %1: %2 (%3×%4)")
+							   .arg(i + 1)
+							   .arg(sc->model().isEmpty() ? sc->name() : sc->model())
+							   .arg(sc->size().width() * sc->devicePixelRatio())
+							   .arg(sc->size().height() * sc->devicePixelRatio())});
+		}
+		return out;
+	}
+
+	void EditTriggers(int index)
+	{
+		std::vector<myobs::Trigger> t = sw_->Triggers(index);
+		if (!triggersui::Edit(this, inputs_[index].name, t, InputRefs(), ScreenList()))
+			return;
+		sw_->SetTriggers(index, t);
 		SaveInputs();
 	}
 
@@ -1115,7 +1157,9 @@ private:
 	void SaveInputs()
 	{
 		QJsonArray arr;
-		for (const Input &in : inputs_) {
+		const auto refs = InputRefs();
+		for (int i = 0; i < (int)inputs_.size(); i++) {
+			const Input &in = inputs_[i];
 			OBSDataAutoRelease s = obs_source_get_settings(in.source);
 			QJsonObject o;
 			o["type"] = in.type;
@@ -1123,6 +1167,7 @@ private:
 			o["tab"] = in.tab;
 			o["volume"] = (double)obs_source_get_volume(in.source);
 			o["routes"] = (int)in.routes;
+			o["triggers"] = triggersui::ToJson(sw_->Triggers(i), refs);
 			o["devices"] = QJsonArray::fromStringList(in.devices);
 			o["afv"] = in.afv;
 			o["settings"] = QJsonDocument::fromJson(QByteArray(obs_data_get_json(s))).object();
@@ -1134,13 +1179,25 @@ private:
 	void RestoreInputs()
 	{
 		const QJsonArray arr = QJsonDocument::fromJson(QSettings().value("inputs/list").toByteArray()).array();
+		/* saved position -> input as restored (null if it could not be created): trigger targets
+		 * are saved by position */
+		std::vector<triggersui::InputRef> saved;
+		std::vector<std::pair<int, QJsonArray>> triggers; /* (restored index, triggers) */
 		for (const auto &v : arr) {
 			const QJsonObject o = v.toObject();
 			const QByteArray json = QJsonDocument(o["settings"].toObject()).toJson(QJsonDocument::Compact);
 			OBSDataAutoRelease s = obs_data_create_from_json(json.constData());
-			Add(o["type"].toString(), o["name"].toString(), s, o["tab"].toString(), o["volume"].toDouble(1.0),
-			    RoutesFrom(o), o["afv"].toBool(true), false, o["devices"].toVariant().toStringList());
+			if (Add(o["type"].toString(), o["name"].toString(), s, o["tab"].toString(), o["volume"].toDouble(1.0),
+				RoutesFrom(o), o["afv"].toBool(true), false, o["devices"].toVariant().toStringList())) {
+				const int index = (int)inputs_.size() - 1;
+				saved.push_back({o["name"].toString(), sw_->InputSource(index)});
+				triggers.push_back({index, o["triggers"].toArray()});
+			} else {
+				saved.push_back({o["name"].toString(), nullptr});
+			}
 		}
+		for (auto &[index, json] : triggers)
+			sw_->SetTriggers(index, triggersui::FromJson(json, saved));
 	}
 
 	myobs::Switcher *sw_;
