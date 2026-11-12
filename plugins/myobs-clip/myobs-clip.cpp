@@ -462,7 +462,10 @@ public:
 		shownCount_++;
 	}
 
-	/* Sound for this tick: exactly the samples the clip time moved by. */
+	/* Sound for this tick: exactly the samples the clip time moved by.
+	 * Never a hard edge: a stop (pause, off air) fades out over 5 ms; a jump while playing (loop,
+	 * seek) fades the old place out over one frame - so the sound has no gap - and the new place
+	 * fades in. */
 	void AudioTick(double t, bool playing)
 	{
 		if (!audio_.Has())
@@ -470,23 +473,54 @@ public:
 		const int64_t target = (int64_t)std::floor(t * sampleRate_);
 		audio_.SetWant(target);
 		const int64_t n = target - audioPos_;
-		if (!playing || n <= 0 || n > (int64_t)sampleRate_ / 5) {
-			/* Still, or a jump (start, resume, seek, loop): continue from here, faded in. */
+		if (!playing) {
+			if (wasPlaying_)
+				Emit(audioPos_, sampleRate_ / 200, -1); /* 5 ms fade-out tail */
+			wasPlaying_ = false;
 			audioPos_ = target;
 			fadeIn_ = true;
 			return;
 		}
+		if (n <= 0 || n > (int64_t)sampleRate_ / 5) {
+			if (wasPlaying_) {
+				obs_video_info ovi = {};
+				const int64_t frame = obs_get_video_info(&ovi) && ovi.fps_num
+							      ? (int64_t)sampleRate_ * ovi.fps_den / ovi.fps_num
+							      : sampleRate_ / 50;
+				Emit(audioPos_, frame, -1); /* the old place fades out, no gap */
+			}
+			wasPlaying_ = true;
+			audioPos_ = target;
+			fadeIn_ = true;
+			return;
+		}
+		Emit(audioPos_, n, fadeIn_ ? 1 : 0);
+		fadeIn_ = false;
+		wasPlaying_ = true;
+		audioPos_ = target;
+	}
+
+	/* n samples from pos; fade: 0 none, 1 = in over the first 5 ms, -1 = out over all n */
+	void Emit(int64_t pos, int64_t n, int fade)
+	{
+		if (n <= 0)
+			return;
 		left_.resize((size_t)n);
 		right_.resize((size_t)n);
-		audio_.Read(audioPos_, (int)n, left_.data(), right_.data());
-		if (fadeIn_) {
-			const int64_t len = std::min<int64_t>(n, sampleRate_ / 200); /* 5 ms */
+		audio_.Read(pos, (int)n, left_.data(), right_.data());
+		if (fade > 0) {
+			const int64_t len = std::min<int64_t>(n, sampleRate_ / 200);
 			for (int64_t i = 0; i < len; i++) {
 				const float g = (float)(i + 1) / (float)len;
 				left_[(size_t)i] *= g;
 				right_[(size_t)i] *= g;
 			}
-			fadeIn_ = false;
+		} else if (fade < 0) {
+			for (int64_t i = 0; i < n; i++) {
+				const float g = 1.0f - (float)(i + 1) / (float)n;
+				left_[(size_t)i] *= g;
+				right_[(size_t)i] *= g;
+			}
 		}
 		obs_source_audio a = {};
 		a.data[0] = reinterpret_cast<const uint8_t *>(left_.data());
@@ -497,7 +531,6 @@ public:
 		a.samples_per_sec = sampleRate_;
 		a.timestamp = os_gettime_ns() - (uint64_t)((double)n * 1e9 / sampleRate_);
 		obs_source_output_audio(source_, &a);
-		audioPos_ = target;
 	}
 
 	/* For the switch test: "decoder, decoded, shown, late". */
@@ -904,6 +937,7 @@ private:
 	uint32_t sampleRate_ = 48000;
 	int64_t audioPos_ = 0;
 	bool fadeIn_ = true;
+	bool wasPlaying_ = false;
 	std::vector<float> left_, right_;
 
 	/* playback (play_) */
