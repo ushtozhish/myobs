@@ -480,6 +480,7 @@ public:
 			if (wasPlaying_)
 				Emit(audioPos_, 2048, -2);
 			wasPlaying_ = false;
+			tsValid_ = false; /* the next start anchors a new sound timeline */
 			audioPos_ = target;
 			fadeIn_ = true;
 			return;
@@ -534,7 +535,18 @@ public:
 		a.speakers = SPEAKERS_STEREO;
 		a.format = AUDIO_FORMAT_FLOAT_PLANAR;
 		a.samples_per_sec = sampleRate_;
-		a.timestamp = os_gettime_ns() - (uint64_t)((double)n * 1e9 / sampleRate_);
+		/* Continuous sound timeline: each chunk starts exactly where the previous one ended
+		 * (counted in samples), anchored to the clock only at a start after a stop, or when the
+		 * count and the clock drift apart by more than 40 ms. Jittery clock stamps made libobs
+		 * place chunks off by a few samples - a gap or overlap inside a tick: a click. */
+		const uint64_t dur = (uint64_t)n * 1000000000ULL / sampleRate_;
+		const uint64_t clock = os_gettime_ns() - dur;
+		if (!tsValid_ || (int64_t)(nextTs_ - clock) > 40000000LL || (int64_t)(clock - nextTs_) > 40000000LL) {
+			nextTs_ = clock;
+			tsValid_ = true;
+		}
+		a.timestamp = nextTs_;
+		nextTs_ += dur;
 		obs_source_output_audio(source_, &a);
 	}
 
@@ -943,6 +955,8 @@ private:
 	int64_t audioPos_ = 0;
 	bool fadeIn_ = true;
 	bool wasPlaying_ = false;
+	bool tsValid_ = false;
+	uint64_t nextTs_ = 0;
 	std::vector<float> left_, right_;
 
 	/* playback (play_) */
