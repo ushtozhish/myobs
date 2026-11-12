@@ -43,7 +43,7 @@ int Switcher::AddInput(obs_source_t *source, const std::string &name)
 	scenes_.push_back(scene);
 	names_.push_back(name);
 	sources_.push_back(source);
-	bus_->Add(source, true, true);
+	bus_->Add(source, 0x7, true); /* Мастер-стрим, A, B */
 	const int index = (int)scenes_.size() - 1;
 	if (index == 0) {
 		queue_.push_back({Request::Kind::Preview, 0, 0});
@@ -99,11 +99,23 @@ bool Switcher::HasAudio(int index) const
 	       (obs_source_get_output_flags(sources_[index]) & OBS_SOURCE_AUDIO) != 0;
 }
 
-void Switcher::SetAudioOnAir(int index, bool onAir)
+void Switcher::SetAudioRoute(int index, int bus, bool on)
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (index >= 0 && index < (int)sources_.size())
-		bus_->SetOnAir(sources_[index], onAir);
+		bus_->SetRoute(sources_[index], bus, on);
+}
+
+uint32_t Switcher::AudioRoutes(int index) const
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	return index >= 0 && index < (int)sources_.size() ? bus_->Routes(sources_[index]) : 0;
+}
+
+obs_source_t *Switcher::InputSource(int index) const
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	return index >= 0 && index < (int)sources_.size() ? sources_[index] : nullptr;
 }
 
 void Switcher::SetAudioAfv(int index, bool afv)
@@ -111,12 +123,6 @@ void Switcher::SetAudioAfv(int index, bool afv)
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (index >= 0 && index < (int)sources_.size())
 		bus_->SetAfv(sources_[index], afv);
-}
-
-bool Switcher::AudioOnAir(int index) const
-{
-	std::lock_guard<std::mutex> lock(mutex_);
-	return index >= 0 && index < (int)sources_.size() && bus_->OnAir(sources_[index]);
 }
 
 bool Switcher::AudioAfv(int index) const

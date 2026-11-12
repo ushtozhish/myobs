@@ -446,6 +446,103 @@ void TestAudio()
 		obs_source_release(s);
 }
 
+/* ---- routing: buses (Мастер-стрим, A, B) and an audio device, all summed in the same tick ---- */
+
+struct LevelMeter {
+	std::mutex m;
+	std::vector<std::pair<uint64_t, double>> blocks;
+	void Add(const float *f, size_t n)
+	{
+		double sum = 0;
+		for (size_t i = 0; i < n; i++)
+			sum += f[i];
+		std::lock_guard<std::mutex> lock(m);
+		blocks.push_back({os_gettime_ns(), n ? sum / n : 0.0});
+	}
+	double Recent()
+	{
+		const uint64_t from = os_gettime_ns() - 400000000ULL;
+		std::lock_guard<std::mutex> lock(m);
+		double sum = 0;
+		int n = 0;
+		for (auto &[t, v] : blocks)
+			if (t >= from) {
+				sum += v;
+				n++;
+			}
+		return n ? sum / n : -1.0;
+	}
+};
+
+LevelMeter g_mix[3];
+void OnMix(void *param, size_t, audio_data *data)
+{
+	if (data && data->data[0])
+		static_cast<LevelMeter *>(param)->Add((const float *)data->data[0], data->frames);
+}
+
+/* stands in for an audio device: records what the router sends to it */
+class MemorySink : public myobs::AudioSink {
+public:
+	LevelMeter meter;
+	std::atomic<uint64_t> frames{0};
+	void Push(const float *l, const float *, size_t n) override
+	{
+		meter.Add(l, n);
+		frames += n;
+	}
+};
+
+void TestRouting()
+{
+	obs_source_t *in[3] = {MakeSoundInput(1, 0.1), MakeSoundInput(2, 0.2), MakeSoundInput(3, 0.4)};
+	for (int m = 0; m < 3; m++)
+		obs_add_raw_audio_callback((size_t)m, nullptr, OnMix, &g_mix[m]);
+	auto dev = std::make_shared<MemorySink>();
+	{
+		myobs::Switcher sw;
+		for (int i = 0; i < 3; i++) {
+			sw.AddInput(in[i], "Route " + std::to_string(i + 1));
+			sw.SetAudioAfv(i, false); /* sound independent of the picture */
+		}
+		Check(sw.AudioRoutes(0) == 0x7, "routing: a new input goes to Мастер-стрим, A and B by default");
+		/* 1 -> Мастер-стрим, 2 -> A, 3 -> B */
+		for (int i = 0; i < 3; i++)
+			for (int b = 0; b < 3; b++)
+				sw.SetAudioRoute(i, b, b == i);
+		/* device: inputs 1 and 2 directly, bus B on top */
+		sw.Audio().AddSink("dev", dev);
+		sw.Audio().SetInputToSink(sw.InputSource(0), "dev", true);
+		sw.Audio().SetInputToSink(sw.InputSource(1), "dev", true);
+		sw.Audio().SetBusToSink(2, "dev", true);
+		std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+		auto expect = [](double got, double want, const char *what) {
+			std::printf("  %-48s %.3f (expected %.3f)\n", what, got, want);
+			Check(std::fabs(got - want) < 0.02, std::string("routing: ") + what);
+		};
+		expect(g_mix[0].Recent(), 0.1, "Мастер-стрим carries input 1 only");
+		expect(g_mix[1].Recent(), 0.2, "bus A carries input 2 only");
+		expect(g_mix[2].Recent(), 0.4, "bus B carries input 3 only");
+		expect(dev->meter.Recent(), 0.7, "device sums inputs 1 + 2 and bus B exactly");
+		sw.SetAudioRoute(0, 1, true);
+		std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+		expect(g_mix[1].Recent(), 0.3, "a second route adds input 1 to bus A");
+		sw.Audio().SetInputToSink(sw.InputSource(1), "dev", false);
+		std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+		expect(dev->meter.Recent(), 0.5, "taking input 2 off the device leaves 1 + B");
+		/* the device timeline: one engine tick of 1024 frames at 48 kHz, nothing lost */
+		const uint64_t f0 = dev->frames.load();
+		std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+		const double rate = (dev->frames.load() - f0) / 2.0;
+		std::printf("  device receives %.0f frames/s\n", rate);
+		Check(rate > 46000 && rate < 50000, "routing: the device gets a continuous 48 kHz stream");
+	}
+	for (int m = 0; m < 3; m++)
+		obs_remove_raw_audio_callback((size_t)m, OnMix, &g_mix[m]);
+	for (obs_source_t *s : in)
+		obs_source_release(s);
+}
+
 void TestRemoveInput()
 {
 	obs_source_t *in[3] = {MakeInput(1), MakeInput(2), MakeInput(3)};
@@ -522,6 +619,7 @@ int main()
 		TestSwitcher();
 		TestRemoveInput();
 		TestAudio();
+		TestRouting();
 	} else {
 		Check(false, "engine start");
 	}

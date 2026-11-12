@@ -44,12 +44,17 @@ public:
 	std::string InputName(int index) const;
 	obs_source_t *InputScene(int index) const; // not referenced; valid while the switcher lives
 
-	// Sound of an input (see audiobus.hpp): «в эфир» and AFV. Inputs without sound ignore it.
+	// Sound of an input (see audiobus.hpp): routes to buses (bit 0 = Мастер-стрим) and AFV.
+	// Inputs without sound ignore it. Devices and bus-to-device sends: Audio().
 	bool HasAudio(int index) const;
-	void SetAudioOnAir(int index, bool onAir);
+	void SetAudioRoute(int index, int bus, bool on);
+	uint32_t AudioRoutes(int index) const;
+	void SetAudioOnAir(int index, bool onAir) { SetAudioRoute(index, 0, onAir); }
+	bool AudioOnAir(int index) const { return (AudioRoutes(index) & 1u) != 0; }
 	void SetAudioAfv(int index, bool afv);
-	bool AudioOnAir(int index) const;
 	bool AudioAfv(int index) const;
+	AudioBus &Audio() { return *bus_; }
+	obs_source_t *InputSource(int index) const; // the input itself (not its scene)
 
 	// Requests (any thread).
 	void SetPreview(int index);
