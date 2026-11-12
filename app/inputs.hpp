@@ -438,7 +438,7 @@ private:
 		QString type; // clip | image | color
 		QString name;
 		QString tab; // empty = no tab
-		uint32_t routes = 0x7; // buses: bit 0 = Мастер-стрим, A, B
+		uint32_t routes = 0x1; // buses: bit 0 = Мастер-стрим, A, B (new inputs: Мастер-стрим only)
 		QStringList devices;   // audio devices this input is sent to
 		bool afv = true;
 		OBSSourceAutoRelease source;
@@ -522,7 +522,7 @@ private:
 		for (const QString &f : files) {
 			OBSDataAutoRelease s = obs_data_create();
 			obs_data_set_string(s, "file", f.toUtf8().constData());
-			Add(type, QFileInfo(f).completeBaseName(), s, CurrentTab(), 1.0, 0x7, true);
+			Add(type, QFileInfo(f).completeBaseName(), s, CurrentTab(), 1.0, 0x1, true);
 		}
 	}
 
@@ -553,7 +553,7 @@ private:
 			return;
 		OBSDataAutoRelease s = obs_data_create();
 		SetColor(s, c);
-		Add("color", QString("Цвет %1").arg(c.name()), s, CurrentTab(), 1.0, 0x7, true);
+		Add("color", QString("Цвет %1").arg(c.name()), s, CurrentTab(), 1.0, 0x1, true);
 	}
 
 	/* Live device input: created, then its settings dialog; Cancel on creation removes it again. */
@@ -571,7 +571,7 @@ private:
 			if (in.type == type)
 				n++;
 		OBSDataAutoRelease s = obs_data_create();
-		if (!Add(type, QString("%1 %2").arg(base).arg(n), s, CurrentTab(), 1.0, 0x7, true, false))
+		if (!Add(type, QString("%1 %2").arg(base).arg(n), s, CurrentTab(), 1.0, 0x1, true, false))
 			return;
 		const int index = (int)inputs_.size() - 1;
 		PropertiesDialog d(inputs_[index].source, QString("Свойства — %1").arg(inputs_[index].name), this);
@@ -818,9 +818,9 @@ private:
 	static uint32_t RoutesFrom(const QJsonObject &o)
 	{
 		if (o.contains("routes"))
-			return (uint32_t)o["routes"].toInt(0x7);
+			return (uint32_t)o["routes"].toInt(0x1);
 		/* older saves: «ЭФИР» button = Мастер-стрим */
-		return o["audioOnAir"].toBool(true) ? 0x7u : 0x6u;
+		return o["audioOnAir"].toBool(true) ? 0x1u : 0x0u;
 	}
 
 	void SetRoute(int i, int bus, bool on)

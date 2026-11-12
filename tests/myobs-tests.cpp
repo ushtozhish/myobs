@@ -505,7 +505,7 @@ void TestRouting()
 			sw.AddInput(in[i], "Route " + std::to_string(i + 1));
 			sw.SetAudioAfv(i, false); /* sound independent of the picture */
 		}
-		Check(sw.AudioRoutes(0) == 0x7, "routing: a new input goes to Мастер-стрим, A and B by default");
+		Check(sw.AudioRoutes(0) == 0x1, "routing: a new input goes to Мастер-стрим only (A and B by hand)");
 		/* 1 -> Мастер-стрим, 2 -> A, 3 -> B */
 		for (int i = 0; i < 3; i++)
 			for (int b = 0; b < 3; b++)

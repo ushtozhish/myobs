@@ -48,7 +48,7 @@ public:
 	AudioBus &operator=(const AudioBus &) = delete;
 
 	/* inputs: routes = bit per bus (bit 0 = Мастер-стрим) */
-	void Add(obs_source_t *input, uint32_t routes = 0x7, bool afv = true);
+	void Add(obs_source_t *input, uint32_t routes = 0x1, bool afv = true);
 	void Remove(obs_source_t *input);
 	void SetRoute(obs_source_t *input, int bus, bool on);
 	uint32_t Routes(obs_source_t *input) const;

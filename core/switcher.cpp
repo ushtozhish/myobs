@@ -43,7 +43,7 @@ int Switcher::AddInput(obs_source_t *source, const std::string &name)
 	scenes_.push_back(scene);
 	names_.push_back(name);
 	sources_.push_back(source);
-	bus_->Add(source, 0x7, true); /* Мастер-стрим, A, B */
+	bus_->Add(source, 0x1, true); /* only Мастер-стрим; other buses are switched on by hand */
 	const int index = (int)scenes_.size() - 1;
 	if (index == 0) {
 		queue_.push_back({Request::Kind::Preview, 0, 0});
