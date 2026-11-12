@@ -96,6 +96,7 @@ QPushButton#cube, QPushButton#afv { padding: 0; font-size: 10px; font-weight: bo
 QPushButton#cube { background: #1b1d21; border: 1px solid #3a3f47; }
 QPushButton#cube:checked { background: #e0312b; border-color: #e0312b; color: #fff; }
 QLabel#mixerSection { color: #f28c1e; padding-top: 8px; }
+QPushButton#record:checked { background: #e0312b; border-color: #e0312b; color: #fff; font-weight: bold; }
 QPushButton#afv:checked { background: #4a2c0c; border-color: #f28c1e; color: #fff; }
 QSlider::groove:horizontal { height: 4px; background: #33373e; }
 QSlider::handle:horizontal { width: 10px; margin: -5px 0; background: #c9ccd1; }

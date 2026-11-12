@@ -17,7 +17,15 @@
 #include "props.hpp"
 #include "switcher.hpp"
 #include "thumbs.hpp"
+#include "recorder.hpp"
 #include "screens.hpp"
+
+#include <QDateTime>
+#include <QSignalBlocker>
+#include <QDir>
+#include <QDesktopServices>
+#include <QStandardPaths>
+#include <QUrl>
 #include "triggers_ui.hpp"
 
 #include <QGuiApplication>
@@ -350,6 +358,16 @@ public:
 		screensBtn->setToolTip("Вывод входов, Program или Preview во весь экран на мониторы и LED");
 		connect(screensBtn, &QPushButton::clicked, this, [this]() { screens_->Dialog(this); });
 		bar->addWidget(screensBtn);
+		bar->addSpacing(18);
+		recordBtn_ = new QPushButton("● Запись", this);
+		recordBtn_->setObjectName("record");
+		recordBtn_->setCheckable(true);
+		recordBtn_->setToolTip("Запись эфира в рабочем кодеке (H.264, ключевой кадр каждые 10 кадров, без B-кадров).\n"
+				       "Правая кнопка — дорожки звука и папка.");
+		recordBtn_->setContextMenuPolicy(Qt::CustomContextMenu);
+		connect(recordBtn_, &QPushButton::toggled, this, [this](bool on) { ToggleRecord(on); });
+		connect(recordBtn_, &QPushButton::customContextMenuRequested, this, [this]() { RecordMenu(); });
+		bar->addWidget(recordBtn_);
 		bar->addStretch();
 		status_ = new QLabel(this);
 		status_->setObjectName("switchStatus");
@@ -406,6 +424,7 @@ public:
 	~InputsPanel() override
 	{
 		sw_->SetScreenHandler(nullptr);
+		recorder_.Stop();
 		screens_.reset();
 		for (InputTile *t : tiles_)
 			delete t;
@@ -422,6 +441,13 @@ public:
 			tiles_[t]->SetState(i == program, i == preview);
 			if (tiles_[t]->Meter())
 				tiles_[t]->Meter()->Update(inputs_[i].audio.get());
+		}
+		if (recorder_.Active()) {
+			const qint64 sec = (QDateTime::currentMSecsSinceEpoch() - recordStart_) / 1000;
+			recordBtn_->setText(QString("● %1:%2:%3")
+						    .arg(sec / 3600, 2, 10, QChar('0'))
+						    .arg(sec / 60 % 60, 2, 10, QChar('0'))
+						    .arg(sec % 60, 2, 10, QChar('0')));
 		}
 		const size_t pending = sw_->PendingRequests();
 		status_->setText(sw_->Transitioning() ? "переход…" : pending ? QString("в очереди: %1").arg(pending) : "");
@@ -841,6 +867,72 @@ private:
 		SaveInputs();
 	}
 
+	/* ---- recording ---- */
+
+	static QString RecordFolder()
+	{
+		const QString def = QStandardPaths::writableLocation(QStandardPaths::MoviesLocation) + "/MyOBS";
+		return QSettings().value("record/folder", def).toString();
+	}
+
+	void ToggleRecord(bool on)
+	{
+		if (!on) {
+			recorder_.Stop();
+			recordBtn_->setText("● Запись");
+			return;
+		}
+		QDir().mkpath(RecordFolder());
+		myobs::RecordSettings rs;
+		rs.path = (RecordFolder() + "/MyOBS_" + QDateTime::currentDateTime().toString("yyyy-MM-dd_HH-mm-ss") +
+			   ".mkv")
+				  .toStdString();
+		rs.audioTracks = (uint32_t)QSettings().value("record/tracks", 1).toInt();
+		if (!recorder_.Start(rs)) {
+			QMessageBox::warning(this, "MyOBS",
+					     QString("Запись не началась: %1").arg(QString::fromStdString(recorder_.Error())));
+			const QSignalBlocker block(recordBtn_);
+			recordBtn_->setChecked(false);
+			return;
+		}
+		recordStart_ = QDateTime::currentMSecsSinceEpoch();
+	}
+
+	void RecordMenu()
+	{
+		QMenu menu(this);
+		const uint32_t tracks = (uint32_t)QSettings().value("record/tracks", 1).toInt();
+		static const char *names[3] = {"Дорожка: Мастер-стрим", "Дорожка: шина A", "Дорожка: шина B"};
+		QAction *acts[3];
+		for (int b = 0; b < 3; b++) {
+			acts[b] = menu.addAction(QString::fromUtf8(names[b]));
+			acts[b]->setCheckable(true);
+			acts[b]->setChecked((tracks >> b) & 1u);
+			acts[b]->setEnabled(!recorder_.Active());
+		}
+		menu.addSeparator();
+		QAction *folder = menu.addAction("Папка записей: " + RecordFolder());
+		QAction *open = menu.addAction("Открыть папку");
+		QAction *chosen = menu.exec(QCursor::pos());
+		if (!chosen)
+			return;
+		for (int b = 0; b < 3; b++)
+			if (chosen == acts[b]) {
+				uint32_t t = chosen->isChecked() ? (tracks | (1u << b)) : (tracks & ~(1u << b));
+				if (!t)
+					t = 1; /* at least one track */
+				QSettings().setValue("record/tracks", (int)t);
+			}
+		if (chosen == folder) {
+			const QString dir = QFileDialog::getExistingDirectory(this, "Папка записей", RecordFolder());
+			if (!dir.isEmpty())
+				QSettings().setValue("record/folder", dir);
+		} else if (chosen == open) {
+			QDir().mkpath(RecordFolder());
+			QDesktopServices::openUrl(QUrl::fromLocalFile(RecordFolder()));
+		}
+	}
+
 	/* ---- triggers ---- */
 
 	std::vector<triggersui::InputRef> InputRefs() const
@@ -1234,5 +1326,8 @@ private:
 	int columns_ = 0;
 	std::map<QString, std::shared_ptr<myobs::DeviceSink>> sinks_;
 	std::unique_ptr<ScreenOutputs> screens_;
+	myobs::Recorder recorder_;
+	QPushButton *recordBtn_ = nullptr;
+	qint64 recordStart_ = 0;
 	bool restoringTabs_ = false;
 };
