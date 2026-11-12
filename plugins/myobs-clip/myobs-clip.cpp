@@ -480,7 +480,7 @@ public:
 			if (wasPlaying_)
 				Emit(audioPos_, 2048, -2);
 			wasPlaying_ = false;
-			tsValid_ = false; /* the next start anchors a new sound timeline */
+			restart_ = true; /* the next start anchors a new sound timeline (never before the tail's end) */
 			audioPos_ = target;
 			fadeIn_ = true;
 			return;
@@ -541,10 +541,19 @@ public:
 		 * place chunks off by a few samples - a gap or overlap inside a tick: a click. */
 		const uint64_t dur = (uint64_t)n * 1000000000ULL / sampleRate_;
 		const uint64_t clock = os_gettime_ns() - dur;
-		if (!tsValid_ || (int64_t)(nextTs_ - clock) > 40000000LL || (int64_t)(clock - nextTs_) > 40000000LL) {
+		/* Never back in time: libobs answers an earlier stamp by throwing away what it still holds
+		 * of this source - the faded tail of a stop - and the sound breaks off at full level. */
+		if (!tsValid_) {
 			nextTs_ = clock;
 			tsValid_ = true;
+		} else if (restart_) {
+			nextTs_ = std::max(nextTs_, clock);
+		} else if ((int64_t)(clock - nextTs_) > 40000000LL) {
+			nextTs_ = clock; /* behind the clock: forward only */
+		} else if ((int64_t)(nextTs_ - clock) > 120000000LL) {
+			nextTs_ = clock; /* far ahead (clock jump): the only backward re-anchor */
 		}
+		restart_ = false;
 		a.timestamp = nextTs_;
 		nextTs_ += dur;
 		obs_source_output_audio(source_, &a);
@@ -957,6 +966,7 @@ private:
 	bool wasPlaying_ = false;
 	bool tsValid_ = false;
 	uint64_t nextTs_ = 0;
+	bool restart_ = false;
 	std::vector<float> left_, right_;
 
 	/* playback (play_) */
