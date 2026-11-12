@@ -835,6 +835,9 @@ void TestRecording()
 std::atomic<float> g_maxStep{0.0f};
 std::atomic<float> g_lastSample{0.0f};
 std::atomic<bool> g_stepArmed{false};
+std::atomic<float> g_stepFrom{0}, g_stepTo{0};
+std::atomic<uint64_t> g_stepAt{0};
+std::atomic<int> g_stepIndex{0};
 void OnAudioSteps(void *, size_t, audio_data *data)
 {
 	if (!data || !data->data[0])
@@ -842,12 +845,65 @@ void OnAudioSteps(void *, size_t, audio_data *data)
 	const float *f = (const float *)data->data[0];
 	float last = g_lastSample.load(), maxStep = g_maxStep.load();
 	for (uint32_t i = 0; i < data->frames; i++) {
-		if (g_stepArmed)
-			maxStep = std::max(maxStep, std::fabs(f[i] - last));
+		if (g_stepArmed && std::fabs(f[i] - last) > maxStep) {
+			maxStep = std::fabs(f[i] - last);
+			g_stepFrom = last;
+			g_stepTo = f[i];
+			g_stepAt = os_gettime_ns();
+			g_stepIndex = (int)i;
+		}
 		last = f[i];
 	}
 	g_lastSample = last;
 	g_maxStep = maxStep;
+}
+
+/* largest sample step inside the first audio track of a file, and where the sound starts */
+void InspectClipAudio(const std::string &path, double &maxStep, int &firstLoud, int &stepAt, int &total)
+{
+	maxStep = 0;
+	firstLoud = -1;
+	stepAt = -1;
+	total = 0;
+	AVFormatContext *fmt = nullptr;
+	if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0)
+		return;
+	avformat_find_stream_info(fmt, nullptr);
+	int ai = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+	if (ai < 0) {
+		avformat_close_input(&fmt);
+		return;
+	}
+	const AVCodec *codec = avcodec_find_decoder(fmt->streams[ai]->codecpar->codec_id);
+	AVCodecContext *dec = avcodec_alloc_context3(codec);
+	avcodec_parameters_to_context(dec, fmt->streams[ai]->codecpar);
+	avcodec_open2(dec, codec, nullptr);
+	AVPacket *pkt = av_packet_alloc();
+	AVFrame *fr = av_frame_alloc();
+	float last = 0;
+	auto take = [&]() {
+		const float *d = (const float *)fr->data[0]; /* AAC decodes to float planar */
+		for (int i = 0; i < fr->nb_samples; i++) {
+			if (firstLoud < 0 && std::fabs(d[i]) > 0.05f)
+				firstLoud = total;
+			if (std::fabs(d[i] - last) > maxStep) {
+				maxStep = std::fabs(d[i] - last);
+				stepAt = total;
+			}
+			last = d[i];
+			total++;
+		}
+	};
+	while (av_read_frame(fmt, pkt) >= 0) {
+		if (pkt->stream_index == ai && avcodec_send_packet(dec, pkt) >= 0)
+			while (avcodec_receive_frame(dec, fr) >= 0)
+				take();
+		av_packet_unref(pkt);
+	}
+	av_frame_free(&fr);
+	av_packet_free(&pkt);
+	avcodec_free_context(&dec);
+	avformat_close_input(&fmt);
 }
 
 /* records the test pattern of input `id` (sound level `level`) for `sec` seconds into `path` */
@@ -890,6 +946,13 @@ void TestClipChaos()
 		}
 	}
 	Check(true, "clip chaos: three test clips recorded in the working codec");
+	for (int i = 0; i < 3; i++) {
+		double step;
+		int first, at, total;
+		InspectClipAudio(files[i], step, first, at, total);
+		std::printf("  clip %d file sound: %d samples, sound starts at %d, largest step %.4f at sample %d\n", i + 1,
+			    total, first, step, at);
+	}
 
 	obs_source_t *clips[3] = {};
 	for (int i = 0; i < 3; i++) {
@@ -909,10 +972,19 @@ void TestClipChaos()
 	g_stepArmed = false;
 	std::vector<int> onAir;
 	std::mutex onAirMutex;
+	struct Sw {
+		uint64_t t;
+		int kind, program;
+	};
+	std::vector<Sw> switches;
 	{
 		myobs::Switcher sw;
 		sw.SetEventCallback([&](const myobs::Switcher::Event &e) {
 			using K = myobs::Switcher::Event::Kind;
+			{
+				std::lock_guard<std::mutex> lock(onAirMutex);
+				switches.push_back({os_gettime_ns(), (int)e.kind, e.program + 1});
+			}
 			if (e.kind == K::Cut || e.kind == K::FadeEnd) {
 				std::lock_guard<std::mutex> lock(onAirMutex);
 				onAir.push_back(e.program + 1);
@@ -993,6 +1065,22 @@ void TestClipChaos()
 	Check(empty == 0, "clip chaos: no empty frames");
 	Check(backwards == 0, "clip chaos: a clip continues from its own frame (never jumps back)");
 	/* levels 0.1..0.3 with 10 ms ramps: an honest step is < 0.001; AAC adds a little */
+	{
+		/* where the largest step happened, relative to the switch events */
+		const uint64_t at = g_stepAt.load();
+		int64_t nearest = INT64_MAX;
+		int kind = -1, prog = 0;
+		for (const Sw &x : switches) {
+			const int64_t d = (int64_t)at - (int64_t)x.t;
+			if (d >= 0 && d < nearest) {
+				nearest = d;
+				kind = x.kind;
+				prog = x.program;
+			}
+		}
+		std::printf("  largest sound step %.4f -> %.4f (sample %d of its block), %.0f ms after event %d (program %d)\n",
+			    g_stepFrom.load(), g_stepTo.load(), g_stepIndex.load(), nearest / 1e6, kind, prog);
+	}
 	Check(g_maxStep.load() < 0.05f, "clip chaos: no clicks in the sound");
 }
 
