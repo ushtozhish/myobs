@@ -1004,6 +1004,7 @@ void TestClipChaos()
 		obs_add_raw_audio_callback(0, nullptr, OnAudioSteps, nullptr);
 		std::this_thread::sleep_for(std::chrono::milliseconds(300));
 		g_stepArmed = true;
+		myobs::AudioBus::SetDebugStep(0.05f);
 		std::mt19937 rng(777);
 		for (int i = 0; i < 60; i++) {
 			sw.SetPreview((int)(rng() % 3));
@@ -1018,6 +1019,7 @@ void TestClipChaos()
 		std::this_thread::sleep_for(std::chrono::milliseconds(400));
 		obs_remove_raw_video_callback(OnFrame, nullptr);
 		obs_remove_raw_audio_callback(0, OnAudioSteps, nullptr);
+		myobs::AudioBus::SetDebugStep(0.0f);
 	}
 	for (obs_source_t *c : clips)
 		obs_source_release(c);
