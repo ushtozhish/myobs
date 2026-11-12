@@ -463,7 +463,7 @@ public:
 	}
 
 	/* Sound for this tick: exactly the samples the clip time moved by.
-	 * Never a hard edge: a stop (pause, off air) fades out over 5 ms; a jump while playing (loop,
+	 * Never a hard edge: a stop (pause, off air) fades out over one audio tick (21 ms); a jump while playing (loop,
 	 * seek) fades the old place out over one frame - so the sound has no gap - and the new place
 	 * fades in. */
 	void AudioTick(double t, bool playing)
@@ -474,8 +474,11 @@ public:
 		audio_.SetWant(target);
 		const int64_t n = target - audioPos_;
 		if (!playing) {
+			/* libobs takes a source's sound only in whole ticks of 1024 samples and drops a
+			 * shorter rest: the tail is one tick of fade-out plus one tick of silence, so what
+			 * may be dropped is already silent */
 			if (wasPlaying_)
-				Emit(audioPos_, sampleRate_ / 200, -1); /* 5 ms fade-out tail */
+				Emit(audioPos_, 2048, -2);
 			wasPlaying_ = false;
 			audioPos_ = target;
 			fadeIn_ = true;
@@ -500,7 +503,8 @@ public:
 		audioPos_ = target;
 	}
 
-	/* n samples from pos; fade: 0 none, 1 = in over the first 5 ms, -1 = out over all n */
+	/* n samples from pos; fade: 0 none, 1 = in over the first 5 ms, -1 = out over all n,
+	 * -2 = out over the first 1024 samples, silence after */
 	void Emit(int64_t pos, int64_t n, int fade)
 	{
 		if (n <= 0)
@@ -516,8 +520,9 @@ public:
 				right_[(size_t)i] *= g;
 			}
 		} else if (fade < 0) {
+			const int64_t len = fade == -2 ? std::min<int64_t>(n, 1024) : n;
 			for (int64_t i = 0; i < n; i++) {
-				const float g = 1.0f - (float)(i + 1) / (float)n;
+				const float g = i < len ? 1.0f - (float)(i + 1) / (float)len : 0.0f;
 				left_[(size_t)i] *= g;
 				right_[(size_t)i] *= g;
 			}
