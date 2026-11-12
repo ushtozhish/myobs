@@ -286,6 +286,9 @@ struct Tick {
 bool AudioBus::Render(uint64_t *tsOut, obs_source_audio_mix *out, uint32_t mixers, size_t channels, size_t sampleRate)
 {
 	std::lock_guard<std::mutex> lock(mutex_);
+	constexpr size_t N = AUDIO_OUTPUT_FRAMES;
+	constexpr size_t kEdge = 128; /* 2.7 ms fades at the edges of an input's sound */
+
 	uint64_t timestamp = 0;
 	for (Input &in : inputs_) {
 		if (obs_source_audio_pending(in.source))
@@ -294,8 +297,21 @@ bool AudioBus::Render(uint64_t *tsOut, obs_source_audio_mix *out, uint32_t mixer
 		if (t && (!timestamp || t < timestamp))
 			timestamp = t;
 	}
+	const bool haveSound = timestamp != 0;
+	if (!haveSound && lastTs_) /* no input has sound now: the held tick still has to go out */
+		timestamp = lastTs_ + util_mul_div64(N, 1000000000ULL, sampleRate);
 
-	/* bus mixes (also those not requested by libobs, when a device takes them) */
+	const size_t ch = std::min<size_t>(channels, 2);
+	struct Dbg {
+		const char *name;
+		size_t offset;
+		float g0, g1, first, last;
+		bool pending, present;
+	};
+	std::vector<Dbg> dbg;
+	const bool debugging = g_debugStep.load() > 0.0f;
+
+	/* buses wanted by devices, and the per-device mixes */
 	uint32_t busesForSinks = 0;
 	for (auto &[id, s] : sinks_)
 		busesForSinks |= s.buses;
@@ -307,20 +323,13 @@ bool AudioBus::Render(uint64_t *tsOut, obs_source_audio_mix *out, uint32_t mixer
 	for (auto &[id, s] : sinks_)
 		sinkMix[id].Clear();
 
-	const size_t ch = std::min<size_t>(channels, 2);
-	struct Dbg {
-		const char *name;
-		size_t offset;
-		float g0, g1, first, last;
-		bool pending, skipped;
-	};
-	std::vector<Dbg> dbg;
-	const bool debugging = g_debugStep.load() > 0.0f;
-	float gains[AUDIO_OUTPUT_FRAMES];
+	float gains[N];
 	static thread_local obs_source_audio_mix mix;
+	static thread_local std::vector<float> cur[2];
 	for (Input &in : inputs_) {
+		/* gains of this tick: AFV/picture ramp and automation ramp */
 		float g = in.gain;
-		for (size_t i = 0; i < AUDIO_OUTPUT_FRAMES; i++) {
+		for (size_t i = 0; i < N; i++) {
 			if (g < in.target)
 				g = std::min(in.target, g + in.step);
 			else if (g > in.target)
@@ -329,10 +338,9 @@ bool AudioBus::Render(uint64_t *tsOut, obs_source_audio_mix *out, uint32_t mixer
 		}
 		const float startGain = in.gain;
 		in.gain = g;
-		/* automation gain (triggers) on top */
 		float a = in.autoGain;
 		const float startAuto = a;
-		for (size_t i = 0; i < AUDIO_OUTPUT_FRAMES; i++) {
+		for (size_t i = 0; i < N; i++) {
 			if (a < in.autoTarget)
 				a = std::min(in.autoTarget, a + in.autoStep);
 			else if (a > in.autoTarget)
@@ -340,48 +348,80 @@ bool AudioBus::Render(uint64_t *tsOut, obs_source_audio_mix *out, uint32_t mixer
 			gains[i] *= a;
 		}
 		in.autoGain = a;
-		if (debugging)
-			dbg.push_back({obs_source_get_name(in.source), 0, startGain * startAuto, g * a, 0, 0,
-				       obs_source_audio_pending(in.source), true});
-		if (!timestamp || (startGain == 0.0f && g == 0.0f) || (startAuto == 0.0f && a == 0.0f))
-			continue;
-		if (!in.routes && in.sinks.empty())
-			continue;
-		if (obs_source_audio_pending(in.source))
-			continue;
-		const uint64_t t = obs_source_get_audio_timestamp(in.source);
-		if (!t)
-			continue;
-		const size_t offset = (size_t)util_mul_div64(t - timestamp, sampleRate, 1000000000ULL);
-		if (offset >= AUDIO_OUTPUT_FRAMES)
-			continue;
-		/* the input's own sound (fader applied) is in mix 0, which is always prepared */
-		obs_source_get_audio_mix(in.source, &mix);
-		const size_t n = AUDIO_OUTPUT_FRAMES - offset;
-		if (debugging && mix.output[0].data[0]) {
-			dbg.back().offset = offset;
-			dbg.back().first = mix.output[0].data[0][0];
-			dbg.back().last = mix.output[0].data[0][AUDIO_OUTPUT_FRAMES - 1];
-			dbg.back().skipped = false;
+
+		/* 1. this tick of the input -> held for the next call */
+		for (auto &c : cur)
+			c.assign(N, 0.0f);
+		bool present = false;
+		size_t offset = 0;
+		const bool pending = obs_source_audio_pending(in.source);
+		const bool audible = !((startGain == 0.0f && g == 0.0f) || (startAuto == 0.0f && a == 0.0f));
+		if (haveSound && !pending && audible && (in.routes || !in.sinks.empty())) {
+			const uint64_t t = obs_source_get_audio_timestamp(in.source);
+			if (t) {
+				offset = (size_t)util_mul_div64(t - timestamp, sampleRate, 1000000000ULL);
+				if (offset < N) {
+					/* the input's own sound (fader applied) is in mix 0, which is always prepared */
+					obs_source_get_audio_mix(in.source, &mix);
+					for (size_t c = 0; c < ch; c++) {
+						const float *src = mix.output[0].data[c];
+						if (!src)
+							continue;
+						for (size_t i = 0; i + offset < N; i++)
+							cur[c][offset + i] = src[i] * gains[i];
+					}
+					if (ch == 1)
+						cur[1] = cur[0];
+					present = true;
+					if (offset) /* sound starting inside the tick: soft start */
+						for (size_t i = 0; i < kEdge && offset + i < N; i++)
+							for (auto &c : cur)
+								c[offset + i] *= (float)(i + 1) / kEdge;
+				}
+			}
 		}
-		auto addTo = [&](float *const *dstCh, size_t count) {
+		if (debugging)
+			dbg.push_back({obs_source_get_name(in.source), offset, startGain * startAuto, g * a, cur[0][0],
+				       cur[0][N - 1], pending, present});
+
+		/* 2. the held (previous) tick goes out now, faded at the edges of the sound */
+		for (auto &h : in.held)
+			if (h.size() != N)
+				h.assign(N, 0.0f);
+		const bool outPresent = in.heldPresent;
+		if (outPresent && !in.beforePresent)
+			for (size_t i = 0; i < kEdge; i++)
+				for (auto &h : in.held)
+					h[i] *= (float)(i + 1) / kEdge;
+		if (outPresent && !present)
+			for (size_t i = 0; i < kEdge; i++)
+				for (auto &h : in.held)
+					h[N - kEdge + i] *= 1.0f - (float)(i + 1) / kEdge;
+		std::swap(in.held[0], cur[0]);
+		std::swap(in.held[1], cur[1]);
+		/* cur = the tick that goes out, held = this tick (for the next call) */
+		in.beforePresent = outPresent;
+		in.heldPresent = present;
+		if (!outPresent)
+			continue;
+
+		auto add = [&](float *const *dst, size_t count) {
 			for (size_t c = 0; c < count; c++) {
-				const float *src = mix.output[0].data[c];
-				float *dst = dstCh[c];
-				if (!src || !dst)
+				if (!dst[c])
 					continue;
-				for (size_t i = 0; i < n; i++)
-					dst[offset + i] += src[i] * gains[i];
+				const float *src = cur[c < 2 ? c : 1].data();
+				for (size_t i = 0; i < N; i++)
+					dst[c][i] += src[i];
 			}
 		};
 		for (int b = 0; b < kMaxBuses; b++) {
 			if (!(in.routes & (1u << b)))
 				continue;
 			if (mixers & (1u << b))
-				addTo(out->output[b].data, channels);
+				add(out->output[b].data, channels);
 			if (busesForSinks & (1u << b)) {
 				float *d[2] = {buses[b].ch[0], buses[b].ch[1]};
-				addTo(d, ch);
+				add(d, 2);
 			}
 		}
 		for (const std::string &id : in.sinks) {
@@ -389,45 +429,42 @@ bool AudioBus::Render(uint64_t *tsOut, obs_source_audio_mix *out, uint32_t mixer
 			if (it == sinkMix.end())
 				continue;
 			float *d[2] = {it->second.ch[0], it->second.ch[1]};
-			addTo(d, ch);
+			add(d, 2);
 		}
 	}
 
-	/* devices: their direct inputs plus the buses sent to them, one tick each (also when silent,
+	/* 3. devices: their direct inputs plus the buses sent to them, one tick each (also when silent,
 	 * so the device timeline never stops) */
 	for (auto &[id, s] : sinks_) {
 		Tick &t = sinkMix[id];
 		for (int b = 0; b < kMaxBuses; b++)
 			if (s.buses & (1u << b))
 				for (size_t c = 0; c < 2; c++)
-					for (size_t i = 0; i < AUDIO_OUTPUT_FRAMES; i++)
+					for (size_t i = 0; i < N; i++)
 						t.ch[c][i] += buses[b].ch[c][i];
-		if (ch == 1)
-			std::memcpy(t.ch[1], t.ch[0], sizeof(t.ch[0]));
 		if (s.sink)
-			s.sink->Push(t.ch[0], t.ch[1], AUDIO_OUTPUT_FRAMES);
+			s.sink->Push(t.ch[0], t.ch[1], N);
 	}
 
 	if (debugging && (mixers & 1u) && out->output[0].data[0]) {
 		const float *m = out->output[0].data[0];
 		float last = g_debugLast;
-		for (size_t i = 0; i < AUDIO_OUTPUT_FRAMES; i++) {
+		for (size_t i = 0; i < N; i++) {
 			if (std::fabs(m[i] - last) > g_debugStep.load()) {
-				blog(LOG_INFO, "[MyOBS audio debug] step %.4f -> %.4f at sample %zu, tick ts %llu", last, m[i], i,
-				     (unsigned long long)timestamp);
+				blog(LOG_INFO, "[MyOBS audio debug] step %.4f -> %.4f at sample %zu", last, m[i], i);
 				for (const Dbg &d : dbg)
-					blog(LOG_INFO,
-					     "[MyOBS audio debug]   %s: offset %zu, gain %.3f -> %.3f, first %.4f last %.4f%s%s",
+					blog(LOG_INFO, "[MyOBS audio debug]   %s: offset %zu, gain %.3f -> %.3f, first %.4f last %.4f%s%s",
 					     d.name, d.offset, d.g0, d.g1, d.first, d.last, d.pending ? " PENDING" : "",
-					     d.skipped ? " skipped" : "");
+					     d.present ? "" : " absent");
 				break;
 			}
 			last = m[i];
 		}
-		g_debugLast = m[AUDIO_OUTPUT_FRAMES - 1];
+		g_debugLast = m[N - 1];
 	}
 	if (!timestamp)
 		return false;
+	lastTs_ = timestamp;
 	*tsOut = timestamp;
 	return true;
 }

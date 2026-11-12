@@ -14,7 +14,11 @@
 // on air (on a FADE the sound crossfades with it). Gains move with short ramps (no clicks).
 //
 // Timing: every input is taken by its timestamp in the same engine audio tick, so everything sent
-// to one bus or one device is summed sample-exactly - inputs never cut into each other. Each device
+// to one bus or one device is summed sample-exactly - inputs never cut into each other.
+// Every input is held one tick (21 ms) and output a tick later: the router then knows whether the
+// input's sound continues, and fades it out at the end of a tick before its sound stops, or in at
+// the start of the tick where it begins - no source (clip, NDI, camera, call) can make a click by a
+// missing tick or a hard start. The whole sound is 21 ms behind its timestamps. Each device
 // has its own clock: its sink keeps a constant delay with a drift buffer (drift.hpp).
 #pragma once
 
@@ -91,6 +95,11 @@ private:
 		float autoGain = 1.0f;
 		float autoTarget = 1.0f;
 		float autoStep = 1.0f;
+		/* one tick of look-ahead (edges without clicks): the tick being output and whether the
+		 * input had sound in the tick before it */
+		std::vector<float> held[2];
+		bool heldPresent = false;
+		bool beforePresent = false;
 	};
 	struct Sink {
 		std::shared_ptr<AudioSink> sink;
@@ -108,6 +117,7 @@ private:
 	std::map<std::string, Sink> sinks_;
 	obs_source_t *program_ = nullptr;
 	obs_source_t *incoming_ = nullptr;
+	uint64_t lastTs_ = 0; // timestamp of the last tick output (a tick with no input sound still goes out)
 };
 
 } // namespace myobs
