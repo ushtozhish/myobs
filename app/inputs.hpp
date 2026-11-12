@@ -4,12 +4,15 @@
  * Click = Preview, double click = on air by CUT, right button = properties, rename, tab, remove.
  * Tabs: «Все» plus own colour-coded tabs; an input belongs to one tab or none.
  * CUT / FADE with the fade length; + Клип / + Картинка / + Цвет.
- * Sound per input: fader, ЭФИР (into the program mix) and AFV (only while its picture is on air).
+ * Sound per input: fader, routing «кубики» M / A / B (buses Мастер-стрим, A, B) and AFV (only while
+ * its picture is on air). «Микшер»: the whole routing matrix - inputs and buses to buses and to every
+ * audio device (devices appear by themselves), with a delay per device.
  * Inputs, their sound settings and the tabs are saved and restored between starts. */
 #pragma once
 
 #include <obs.hpp>
 
+#include "devices.hpp"
 #include "display.hpp"
 #include "props.hpp"
 #include "switcher.hpp"
@@ -52,6 +55,7 @@
 #include <atomic>
 #include <cmath>
 #include <functional>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -175,18 +179,23 @@ public:
 			fader_ = new QSlider(Qt::Horizontal, this);
 			fader_->setRange(0, 1000);
 			fader_->setToolTip("Громкость входа");
-			onAir_ = new QPushButton("ЭФИР", this);
-			onAir_->setObjectName("audioOnAir");
-			onAir_->setCheckable(true);
-			onAir_->setFixedSize(44, 20);
-			onAir_->setToolTip("Звук входа в эфире (в общем миксе)");
+			static const char *busNames[3] = {"M", "A", "B"};
+			static const char *busTips[3] = {"Шина «Мастер-стрим»: стрим и запись эфира", "Шина A", "Шина B"};
+			for (int b = 0; b < 3; b++) {
+				cubes_[b] = new QPushButton(busNames[b], this);
+				cubes_[b]->setObjectName("cube");
+				cubes_[b]->setCheckable(true);
+				cubes_[b]->setFixedSize(20, 20);
+				cubes_[b]->setToolTip(busTips[b]);
+			}
 			afv_ = new QPushButton("AFV", this);
 			afv_->setObjectName("afv");
 			afv_->setCheckable(true);
 			afv_->setFixedSize(36, 20);
 			afv_->setToolTip("Звук следует за картинкой: звучит, только пока вход в эфире; на FADE — плавно");
 			row->addWidget(fader_, 1);
-			row->addWidget(onAir_);
+			for (QPushButton *c : cubes_)
+				row->addWidget(c);
 			row->addWidget(afv_);
 			left->addLayout(row);
 		}
@@ -221,7 +230,7 @@ public:
 	QWidget *Thumb() const { return thumb_; }
 	obs_source_t *Scene() const { return scene_; }
 	QSlider *Fader() const { return fader_; }
-	QPushButton *OnAir() const { return onAir_; }
+	QPushButton *Cube(int bus) const { return cubes_[bus]; }
 	QPushButton *Afv() const { return afv_; }
 	MeterBar *Meter() const { return meter_; }
 
@@ -269,7 +278,7 @@ private:
 	QLabel *number_ = nullptr;
 	QLabel *name_ = nullptr;
 	QSlider *fader_ = nullptr;
-	QPushButton *onAir_ = nullptr;
+	QPushButton *cubes_[3] = {nullptr, nullptr, nullptr};
 	QPushButton *afv_ = nullptr;
 	MeterBar *meter_ = nullptr;
 	QColor tabColor_;
@@ -327,6 +336,11 @@ public:
 		bar->addWidget(addDeckLink);
 		bar->addWidget(addNdi);
 		bar->addWidget(addCall);
+		bar->addSpacing(18);
+		auto *mixer = new QPushButton("Микшер", this);
+		mixer->setToolTip("Маршрутизация звука: входы и шины → шины и звуковые устройства");
+		connect(mixer, &QPushButton::clicked, this, [this]() { MixerDialog(); });
+		bar->addWidget(mixer);
 		bar->addStretch();
 		status_ = new QLabel(this);
 		status_->setObjectName("switchStatus");
@@ -363,6 +377,7 @@ public:
 
 		RestoreTabs();
 		RestoreInputs();
+		RestoreBusSends();
 		RebuildTiles();
 	}
 
@@ -423,7 +438,8 @@ private:
 		QString type; // clip | image | color
 		QString name;
 		QString tab; // empty = no tab
-		bool audioOnAir = true;
+		uint32_t routes = 0x7; // buses: bit 0 = Мастер-стрим, A, B
+		QStringList devices;   // audio devices this input is sent to
 		bool afv = true;
 		OBSSourceAutoRelease source;
 		std::unique_ptr<InputAudio> audio;
@@ -473,7 +489,7 @@ private:
 	}
 
 	bool Add(const QString &type, const QString &name, obs_data_t *settings, const QString &tab, double volume,
-		 bool audioOnAir, bool afv, bool save = true)
+		 uint32_t routes, bool afv, bool save = true, const QStringList &devices = {})
 	{
 		OBSSourceAutoRelease src = obs_source_create(SourceId(type), name.toUtf8().constData(), settings, nullptr);
 		if (!src) {
@@ -483,9 +499,14 @@ private:
 		obs_source_set_volume(src, (float)volume);
 		const bool hasAudio = (obs_source_get_output_flags(src) & OBS_SOURCE_AUDIO) != 0;
 		const int index = sw_->AddInput(src, name.toStdString());
-		sw_->SetAudioOnAir(index, audioOnAir);
+		for (int b = 0; b < 3; b++)
+			sw_->SetAudioRoute(index, b, (routes >> b) & 1u);
+		for (const QString &d : devices) {
+			EnsureSink(d);
+			sw_->Audio().SetInputToSink(sw_->InputSource(index), d.toStdString(), true);
+		}
 		sw_->SetAudioAfv(index, afv);
-		Input in{type, name, tab, audioOnAir, afv, std::move(src), nullptr};
+		Input in{type, name, tab, routes, devices, afv, std::move(src), nullptr};
 		if (hasAudio)
 			in.audio = std::make_unique<InputAudio>(in.source);
 		inputs_.push_back(std::move(in));
@@ -501,7 +522,7 @@ private:
 		for (const QString &f : files) {
 			OBSDataAutoRelease s = obs_data_create();
 			obs_data_set_string(s, "file", f.toUtf8().constData());
-			Add(type, QFileInfo(f).completeBaseName(), s, CurrentTab(), 1.0, true, true);
+			Add(type, QFileInfo(f).completeBaseName(), s, CurrentTab(), 1.0, 0x7, true);
 		}
 	}
 
@@ -532,7 +553,7 @@ private:
 			return;
 		OBSDataAutoRelease s = obs_data_create();
 		SetColor(s, c);
-		Add("color", QString("Цвет %1").arg(c.name()), s, CurrentTab(), 1.0, true, true);
+		Add("color", QString("Цвет %1").arg(c.name()), s, CurrentTab(), 1.0, 0x7, true);
 	}
 
 	/* Live device input: created, then its settings dialog; Cancel on creation removes it again. */
@@ -550,7 +571,7 @@ private:
 			if (in.type == type)
 				n++;
 		OBSDataAutoRelease s = obs_data_create();
-		if (!Add(type, QString("%1 %2").arg(base).arg(n), s, CurrentTab(), 1.0, true, true, false))
+		if (!Add(type, QString("%1 %2").arg(base).arg(n), s, CurrentTab(), 1.0, 0x7, true, false))
 			return;
 		const int index = (int)inputs_.size() - 1;
 		PropertiesDialog d(inputs_[index].source, QString("Свойства — %1").arg(inputs_[index].name), this);
@@ -623,16 +644,14 @@ private:
 			};
 			if (in.audio) {
 				t->Fader()->setValue((int)std::lround(in.audio->Deflection() * 1000.0f));
-				t->OnAir()->setChecked(in.audioOnAir);
+				for (int b = 0; b < 3; b++) {
+					t->Cube(b)->setChecked((in.routes >> b) & 1u);
+					connect(t->Cube(b), &QPushButton::toggled, this, [this, i, b](bool v) { SetRoute(i, b, v); });
+				}
 				t->Afv()->setChecked(in.afv);
 				InputAudio *audio = in.audio.get();
 				connect(t->Fader(), &QSlider::valueChanged, this, [audio](int v) { audio->SetDeflection(v / 1000.0f); });
 				connect(t->Fader(), &QSlider::sliderReleased, this, [this]() { SaveInputs(); });
-				connect(t->OnAir(), &QPushButton::toggled, this, [this, i](bool v) {
-					inputs_[i].audioOnAir = v;
-					sw_->SetAudioOnAir(i, v);
-					SaveInputs();
-				});
 				connect(t->Afv(), &QPushButton::toggled, this, [this, i](bool v) {
 					inputs_[i].afv = v;
 					sw_->SetAudioAfv(i, v);
@@ -794,6 +813,189 @@ private:
 		SaveInputs();
 	}
 
+	/* ---- sound routing ---- */
+
+	static uint32_t RoutesFrom(const QJsonObject &o)
+	{
+		if (o.contains("routes"))
+			return (uint32_t)o["routes"].toInt(0x7);
+		/* older saves: «ЭФИР» button = Мастер-стрим */
+		return o["audioOnAir"].toBool(true) ? 0x7u : 0x6u;
+	}
+
+	void SetRoute(int i, int bus, bool on)
+	{
+		inputs_[i].routes = on ? (inputs_[i].routes | (1u << bus)) : (inputs_[i].routes & ~(1u << bus));
+		sw_->SetAudioRoute(i, bus, on);
+		SaveInputs();
+	}
+
+	double DeviceDelay(const QString &id) const
+	{
+		return QJsonDocument::fromJson(QSettings().value("audio/deviceDelay").toByteArray()).object()[id].toDouble(40.0);
+	}
+
+	void SetDeviceDelay(const QString &id, double ms)
+	{
+		QJsonObject o = QJsonDocument::fromJson(QSettings().value("audio/deviceDelay").toByteArray()).object();
+		o[id] = ms;
+		QSettings().setValue("audio/deviceDelay", QJsonDocument(o).toJson(QJsonDocument::Compact));
+		auto it = sinks_.find(id);
+		if (it != sinks_.end())
+			it->second->SetDelayMs(ms);
+	}
+
+	/* a device is opened the first time something is sent to it */
+	void EnsureSink(const QString &id)
+	{
+		if (sinks_.count(id))
+			return;
+		auto sink = std::make_shared<myobs::DeviceSink>(id.toStdString(), DeviceDelay(id));
+		sinks_[id] = sink;
+		sw_->Audio().AddSink(id.toStdString(), sink);
+	}
+
+	void SetInputDevice(int i, const QString &id, bool on)
+	{
+		if (on) {
+			EnsureSink(id);
+			if (!inputs_[i].devices.contains(id))
+				inputs_[i].devices << id;
+		} else {
+			inputs_[i].devices.removeAll(id);
+		}
+		sw_->Audio().SetInputToSink(sw_->InputSource(i), id.toStdString(), on);
+		SaveInputs();
+	}
+
+	QJsonObject BusSends() const
+	{
+		return QJsonDocument::fromJson(QSettings().value("audio/busToDevice").toByteArray()).object();
+	}
+
+	void SetBusDevice(int bus, const QString &id, bool on)
+	{
+		if (on)
+			EnsureSink(id);
+		sw_->Audio().SetBusToSink(bus, id.toStdString(), on);
+		QJsonObject o = BusSends();
+		uint32_t mask = (uint32_t)o[id].toInt(0);
+		mask = on ? (mask | (1u << bus)) : (mask & ~(1u << bus));
+		o[id] = (int)mask;
+		QSettings().setValue("audio/busToDevice", QJsonDocument(o).toJson(QJsonDocument::Compact));
+	}
+
+	void RestoreBusSends()
+	{
+		const QJsonObject o = BusSends();
+		for (auto it = o.begin(); it != o.end(); ++it) {
+			const uint32_t mask = (uint32_t)it.value().toInt(0);
+			if (!mask)
+				continue;
+			EnsureSink(it.key());
+			for (int b = 0; b < 3; b++)
+				if (mask & (1u << b))
+					sw_->Audio().SetBusToSink(b, it.key().toStdString(), true);
+		}
+	}
+
+	/* «Микшер»: routing matrix with cubes. Rows: inputs with sound, then the buses.
+	 * Columns: buses M / A / B, then every playback device (each device appears by itself). */
+	void MixerDialog()
+	{
+		const std::vector<myobs::AudioDeviceInfo> devices = myobs::ListOutputDevices();
+		QDialog d(this);
+		d.setWindowTitle("Микшер — маршрутизация звука");
+		auto *root = new QVBoxLayout(&d);
+		auto *scroll = new QScrollArea(&d);
+		scroll->setWidgetResizable(true);
+		auto *host = new QWidget(scroll);
+		auto *grid = new QGridLayout(host);
+		grid->setHorizontalSpacing(6);
+		grid->setVerticalSpacing(4);
+		scroll->setWidget(host);
+		root->addWidget(scroll, 1);
+		static const char *busNames[3] = {"M\nМастер-стрим", "A", "B"};
+		const int devCol0 = 4;
+		/* headers */
+		for (int b = 0; b < 3; b++) {
+			auto *h = new QLabel(QString::fromUtf8(busNames[b]).replace("\\n", "\n"), host);
+			h->setAlignment(Qt::AlignCenter);
+			grid->addWidget(h, 0, 1 + b);
+		}
+		for (size_t k = 0; k < devices.size(); k++) {
+			const QString id = QString::fromStdString(devices[k].id);
+			auto *box = new QWidget(host);
+			auto *v = new QVBoxLayout(box);
+			v->setContentsMargins(0, 0, 0, 0);
+			auto *name = new QLabel(QString::fromStdString(devices[k].name), box);
+			name->setWordWrap(true);
+			name->setMaximumWidth(140);
+			name->setAlignment(Qt::AlignCenter);
+			auto *delay = new QSpinBox(box);
+			delay->setRange(10, 1000);
+			delay->setSuffix(" мс");
+			delay->setValue((int)DeviceDelay(id));
+			delay->setToolTip("Задержка устройства: выравнивает звук в зале с экранами");
+			connect(delay, &QSpinBox::valueChanged, this, [this, id](int v) { SetDeviceDelay(id, v); });
+			v->addWidget(name);
+			v->addWidget(delay);
+			grid->addWidget(box, 0, devCol0 + (int)k);
+		}
+		auto cube = [&](bool on, auto onToggle) {
+			auto *c = new QPushButton(host);
+			c->setObjectName("cube");
+			c->setCheckable(true);
+			c->setChecked(on);
+			c->setFixedSize(26, 26);
+			connect(c, &QPushButton::toggled, this, onToggle);
+			return c;
+		};
+		int row = 1;
+		for (int i = 0; i < (int)inputs_.size(); i++) {
+			if (!inputs_[i].audio)
+				continue;
+			grid->addWidget(new QLabel(inputs_[i].name, host), row, 0);
+			for (int b = 0; b < 3; b++)
+				grid->addWidget(cube((inputs_[i].routes >> b) & 1u, [this, i, b](bool v) {
+							SetRoute(i, b, v);
+							RebuildTiles();
+						}),
+						row, 1 + b, Qt::AlignCenter);
+			for (size_t k = 0; k < devices.size(); k++) {
+				const QString id = QString::fromStdString(devices[k].id);
+				grid->addWidget(cube(inputs_[i].devices.contains(id),
+						     [this, i, id](bool v) { SetInputDevice(i, id, v); }),
+						row, devCol0 + (int)k, Qt::AlignCenter);
+			}
+			row++;
+		}
+		auto *sep = new QLabel("Шины → устройства", host);
+		sep->setObjectName("mixerSection");
+		grid->addWidget(sep, row++, 0, 1, 4);
+		static const char *busRows[3] = {"Шина M (Мастер-стрим)", "Шина A", "Шина B"};
+		const QJsonObject sends = BusSends();
+		for (int b = 0; b < 3; b++) {
+			grid->addWidget(new QLabel(QString::fromUtf8(busRows[b]), host), row, 0);
+			for (size_t k = 0; k < devices.size(); k++) {
+				const QString id = QString::fromStdString(devices[k].id);
+				const bool on = ((uint32_t)sends[id].toInt(0) >> b) & 1u;
+				grid->addWidget(cube(on, [this, b, id](bool v) { SetBusDevice(b, id, v); }), row,
+						devCol0 + (int)k, Qt::AlignCenter);
+			}
+			row++;
+		}
+		if (devices.empty())
+			grid->addWidget(new QLabel("Звуковые устройства вывода не найдены.", host), row++, 0, 1, 4);
+		grid->setRowStretch(row, 1);
+		grid->setColumnStretch(devCol0 + (int)devices.size(), 1);
+		auto *bb = new QDialogButtonBox(QDialogButtonBox::Close, &d);
+		connect(bb, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+		root->addWidget(bb);
+		d.resize(820, 480);
+		d.exec();
+	}
+
 	/* ---- tabs ---- */
 
 	QString AddTab()
@@ -920,7 +1122,8 @@ private:
 			o["name"] = in.name;
 			o["tab"] = in.tab;
 			o["volume"] = (double)obs_source_get_volume(in.source);
-			o["audioOnAir"] = in.audioOnAir;
+			o["routes"] = (int)in.routes;
+			o["devices"] = QJsonArray::fromStringList(in.devices);
 			o["afv"] = in.afv;
 			o["settings"] = QJsonDocument::fromJson(QByteArray(obs_data_get_json(s))).object();
 			arr.append(o);
@@ -936,7 +1139,7 @@ private:
 			const QByteArray json = QJsonDocument(o["settings"].toObject()).toJson(QJsonDocument::Compact);
 			OBSDataAutoRelease s = obs_data_create_from_json(json.constData());
 			Add(o["type"].toString(), o["name"].toString(), s, o["tab"].toString(), o["volume"].toDouble(1.0),
-			    o["audioOnAir"].toBool(true), o["afv"].toBool(true), false);
+			    RoutesFrom(o), o["afv"].toBool(true), false, o["devices"].toVariant().toStringList());
 		}
 	}
 
@@ -951,5 +1154,6 @@ private:
 	QSpinBox *fadeMs_ = nullptr;
 	QLabel *status_ = nullptr;
 	int columns_ = 0;
+	std::map<QString, std::shared_ptr<myobs::DeviceSink>> sinks_;
 	bool restoringTabs_ = false;
 };
