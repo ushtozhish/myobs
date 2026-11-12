@@ -13,6 +13,11 @@
  */
 
 #include <obs.h>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+}
 #include <util/base.h>
 #include <util/platform.h>
 
@@ -32,6 +37,7 @@
 #include <vector>
 #include <random>
 
+#include "recorder.hpp"
 #include "screenfeeds.hpp"
 #include "switcher.hpp"
 
@@ -669,6 +675,161 @@ void TestScreens()
 		obs_source_release(s);
 }
 
+/* ---- recording in the working codec: the file is decoded and checked frame by frame ---- */
+
+struct FileReport {
+	int videoFrames = 0, keyframes = 0, badKeyGap = 0, bFrames = 0, audioStreams = 0;
+	int codesRead = 0, repeats = 0, gaps = 0, backwards = 0;
+	double videoSec = 0, audioSec = 0;
+	std::string error;
+};
+
+FileReport InspectRecording(const std::string &path)
+{
+	FileReport r;
+	AVFormatContext *fmt = nullptr;
+	if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) {
+		r.error = "cannot open";
+		return r;
+	}
+	avformat_find_stream_info(fmt, nullptr);
+	int vIdx = -1;
+	std::vector<int> aIdx;
+	for (unsigned i = 0; i < fmt->nb_streams; i++) {
+		if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && vIdx < 0)
+			vIdx = (int)i;
+		if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+			aIdx.push_back((int)i);
+	}
+	r.audioStreams = (int)aIdx.size();
+	if (vIdx < 0) {
+		r.error = "no video";
+		avformat_close_input(&fmt);
+		return r;
+	}
+	const AVCodec *codec = avcodec_find_decoder(fmt->streams[vIdx]->codecpar->codec_id);
+	AVCodecContext *dec = avcodec_alloc_context3(codec);
+	avcodec_parameters_to_context(dec, fmt->streams[vIdx]->codecpar);
+	avcodec_open2(dec, codec, nullptr);
+	AVPacket *pkt = av_packet_alloc();
+	AVFrame *frame = av_frame_alloc();
+	int sinceKey = -1, lastCode = -1;
+	int64_t vFirst = INT64_MIN, vLast = 0, aFirst = INT64_MIN, aLast = 0;
+	auto take = [&](AVFrame *f) {
+		r.videoFrames++;
+		if (f->pict_type == AV_PICTURE_TYPE_B)
+			r.bFrames++;
+		const int y = (int)kH / 18;
+		int code = 0;
+		bool clean = true;
+		for (int b = 0; b < 16; b++) {
+			const int x = (2 * b + 1) * (int)kW / 32;
+			const uint8_t v = f->data[0][(size_t)y * f->linesize[0] + x];
+			if (v > 126)
+				code |= 1 << b;
+			if (v > 60 && v < 190)
+				clean = false;
+		}
+		if (!clean || (code >> 12) != 1)
+			return;
+		r.codesRead++;
+		if (lastCode >= 0) {
+			const int d = code - lastCode;
+			if (d < 0)
+				r.backwards++;
+			else if (d == 0)
+				r.repeats++;
+			else if (d > 1)
+				r.gaps++;
+		}
+		lastCode = code;
+	};
+	while (av_read_frame(fmt, pkt) >= 0) {
+		if (pkt->stream_index == vIdx) {
+			if (pkt->flags & AV_PKT_FLAG_KEY) {
+				r.keyframes++;
+				if (sinceKey >= 0 && sinceKey != 10)
+					r.badKeyGap++;
+				sinceKey = 1;
+			} else if (sinceKey >= 0) {
+				sinceKey++;
+			}
+			if (pkt->pts != AV_NOPTS_VALUE) {
+				if (vFirst == INT64_MIN)
+					vFirst = pkt->pts;
+				vLast = std::max(vLast, pkt->pts + pkt->duration);
+			}
+			if (avcodec_send_packet(dec, pkt) >= 0)
+				while (avcodec_receive_frame(dec, frame) >= 0)
+					take(frame);
+		} else if (!aIdx.empty() && pkt->stream_index == aIdx[0] && pkt->pts != AV_NOPTS_VALUE) {
+			if (aFirst == INT64_MIN)
+				aFirst = pkt->pts;
+			aLast = std::max(aLast, pkt->pts + pkt->duration);
+		}
+		av_packet_unref(pkt);
+	}
+	avcodec_send_packet(dec, nullptr);
+	while (avcodec_receive_frame(dec, frame) >= 0)
+		take(frame);
+	if (vFirst != INT64_MIN)
+		r.videoSec = (vLast - vFirst) * av_q2d(fmt->streams[vIdx]->time_base);
+	if (aFirst != INT64_MIN)
+		r.audioSec = (aLast - aFirst) * av_q2d(fmt->streams[aIdx[0]]->time_base);
+	av_frame_free(&frame);
+	av_packet_free(&pkt);
+	avcodec_free_context(&dec);
+	avformat_close_input(&fmt);
+	return r;
+}
+
+void TestRecording()
+{
+	char *dir = os_get_executable_path_ptr("");
+	const std::string path = std::string(dir ? dir : "") + "record-test.mkv";
+	bfree(dir);
+	os_unlink(path.c_str());
+	obs_source_t *in[2] = {MakeSoundInput(1, 0.1), MakeSoundInput(2, 0.2)};
+	{
+		myobs::Switcher sw;
+		sw.AddInput(in[0], "Rec program");
+		sw.AddInput(in[1], "Rec bus A");
+		sw.SetAudioRoute(1, 0, false);
+		sw.SetAudioRoute(1, 1, true);
+		sw.SetAudioAfv(1, false);
+		std::this_thread::sleep_for(std::chrono::milliseconds(500));
+		myobs::Recorder rec;
+		myobs::RecordSettings rs;
+		rs.path = path;
+		rs.audioTracks = 0x3; /* Мастер-стрим + A */
+		const bool started = rec.Start(rs);
+		std::printf("  recorder: %s, encoder %s %s\n", started ? "started" : "FAILED", rec.VideoEncoderId().c_str(),
+			    rec.Error().c_str());
+		Check(started, "recording: starts in the working codec");
+		if (!started) {
+			for (obs_source_t *s : in)
+				obs_source_release(s);
+			return;
+		}
+		std::this_thread::sleep_for(std::chrono::seconds(5));
+		rec.Stop();
+	}
+	const FileReport r = InspectRecording(path);
+	std::printf("  file: %d frames, %d key frames (bad gaps %d), B-frames %d, audio tracks %d, video %.2f s, "
+		    "audio %.2f s, codes %d (repeats %d, gaps %d, backwards %d) %s\n",
+		    r.videoFrames, r.keyframes, r.badKeyGap, r.bFrames, r.audioStreams, r.videoSec, r.audioSec,
+		    r.codesRead, r.repeats, r.gaps, r.backwards, r.error.c_str());
+	Check(r.error.empty() && r.videoFrames >= 120, "recording: the file has the program video (about 5 s)");
+	Check(r.keyframes >= 10 && r.badKeyGap == 0, "recording: a key frame exactly every 10 frames");
+	Check(r.bFrames == 0, "recording: no B-frames");
+	Check(r.audioStreams == 2, "recording: two sound tracks (Мастер-стрим, A)");
+	Check(std::fabs(r.audioSec - r.videoSec) < 0.15, "recording: sound and picture of equal length (in sync)");
+	Check(r.codesRead >= r.videoFrames - 2 && r.backwards == 0, "recording: every frame is the program frame, in order");
+	Check(r.repeats + r.gaps <= r.videoFrames / 20, "recording: no dropped or doubled frames (within 5% on CI)");
+	for (obs_source_t *s : in)
+		obs_source_release(s);
+}
+
 void TestRemoveInput()
 {
 	obs_source_t *in[3] = {MakeInput(1), MakeInput(2), MakeInput(3)};
@@ -721,7 +882,7 @@ void TestSwitcher()
 
 void TestPlugins()
 {
-	myobs::LoadPlugins({"obs-transitions", "win-dshow", "decklink", "image-source"});
+	myobs::LoadPlugins({"obs-transitions", "win-dshow", "decklink", "image-source", "obs-ffmpeg", "obs-x264"});
 	const char *name = obs_source_get_display_name("myobs_clip");
 	Check(name != nullptr, "«Клип» input registered (myobs_clip)");
 	Check(obs_source_get_display_name("dshow_input") != nullptr, "camera / capture card input registered (dshow_input)");
@@ -748,6 +909,7 @@ int main()
 		TestRouting();
 		TestTriggers();
 		TestScreens();
+		TestRecording();
 	} else {
 		Check(false, "engine start");
 	}
