@@ -543,6 +543,102 @@ void TestRouting()
 		obs_source_release(s);
 }
 
+/* ---- triggers: automatic sound when inputs go on / off air ---- */
+
+double LevelNow(double windowSec = 0.25)
+{
+	const uint64_t from = os_gettime_ns() - (uint64_t)(windowSec * 1e9);
+	std::lock_guard<std::mutex> lock(g_audioMutex);
+	double sum = 0;
+	int n = 0;
+	for (auto &[t, v] : g_audioBlocks)
+		if (t >= from) {
+			sum += v;
+			n++;
+		}
+	return n ? sum / n : -1.0;
+}
+
+void TestTriggers()
+{
+	using A = myobs::TriggerAction;
+	obs_source_t *in[3] = {MakeSoundInput(1, 0.1), MakeSoundInput(2, 0.2), MakeSoundInput(3, 0.4)};
+	obs_add_raw_audio_callback(0, nullptr, OnAudio, nullptr);
+	{
+		myobs::Switcher sw; /* 0 = studio, 1 = advert, 2 = video clip */
+		for (int i = 0; i < 3; i++)
+			sw.AddInput(in[i], "T" + std::to_string(i + 1));
+		sw.SetAudioAfv(0, false); /* studio microphones always live (unless automation says otherwise) */
+		obs_source_t *studio = sw.InputSource(0);
+
+		/* advert: on air -> studio to silence over 1 s, advert as it is; after 2 s back to studio;
+		 * off air -> studio back as it was over 0.5 s */
+		myobs::Trigger advOn{myobs::TriggerEvent::OnAir, {}};
+		A down;
+		down.target = studio;
+		down.level = A::Level::Off;
+		down.rampSec = 1.0;
+		advOn.actions.push_back(down);
+		A back;
+		back.kind = A::Kind::GoOnAir;
+		back.target = studio;
+		back.delaySec = 2.0;
+		advOn.actions.push_back(back);
+		myobs::Trigger advOff{myobs::TriggerEvent::OffAir, {}};
+		A restore;
+		restore.target = studio;
+		restore.level = A::Level::Restore;
+		restore.rampSec = 0.5;
+		advOff.actions.push_back(restore);
+		sw.SetTriggers(1, {advOn, advOff});
+
+		/* clip: on air -> crossfade: studio out and the clip in from silence, both over 1 s */
+		myobs::Trigger clipOn{myobs::TriggerEvent::OnAir, {}};
+		clipOn.actions.push_back(down);
+		A in1;
+		in1.level = A::Level::Restore; /* target = the clip itself */
+		in1.fromSilence = true;
+		in1.rampSec = 1.0;
+		clipOn.actions.push_back(in1);
+		myobs::Trigger clipOff{myobs::TriggerEvent::OffAir, {}};
+		clipOff.actions.push_back(restore);
+		sw.SetTriggers(2, {clipOn, clipOff});
+
+		auto expect = [](double got, double lo, double hi, const char *what) {
+			std::printf("  %-58s %.3f (expected %.2f..%.2f)\n", what, got, lo, hi);
+			Check(got >= lo && got <= hi, std::string("triggers: ") + what);
+		};
+		std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+		expect(LevelNow(), 0.09, 0.11, "studio on air: studio only");
+
+		sw.SetPreview(1);
+		sw.Cut();
+		std::this_thread::sleep_for(std::chrono::milliseconds(1000)); /* audio path latency ~ tick buffering */
+		const double mid = LevelNow(0.1);
+		std::this_thread::sleep_for(std::chrono::milliseconds(900));
+		expect(mid, 0.2, 0.3, "advert cut in: studio is fading out (between)");
+		expect(LevelNow(0.15), 0.19, 0.21, "studio faded to silence, advert as it is");
+		std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+		Check(sw.Program() == 0, "triggers: «через 2 с» the advert put the studio back on air");
+		expect(LevelNow(), 0.09, 0.11, "advert off air: studio back as it was");
+
+		sw.SetPreview(2);
+		sw.Cut();
+		std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+		const double cross = LevelNow(0.1);
+		std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+		expect(cross, 0.12, 0.38, "clip cut in: crossfade under way (studio out, clip in)");
+		expect(LevelNow(), 0.39, 0.41, "after the crossfade: clip only");
+		sw.SetPreview(0);
+		sw.Cut();
+		std::this_thread::sleep_for(std::chrono::milliseconds(1800));
+		expect(LevelNow(), 0.09, 0.11, "back to studio: clip off (AFV), studio as it was");
+	}
+	obs_remove_raw_audio_callback(0, OnAudio, nullptr);
+	for (obs_source_t *s : in)
+		obs_source_release(s);
+}
+
 void TestRemoveInput()
 {
 	obs_source_t *in[3] = {MakeInput(1), MakeInput(2), MakeInput(3)};
@@ -620,6 +716,7 @@ int main()
 		TestRemoveInput();
 		TestAudio();
 		TestRouting();
+		TestTriggers();
 	} else {
 		Check(false, "engine start");
 	}

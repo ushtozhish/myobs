@@ -1,5 +1,10 @@
 #include "switcher.hpp"
 
+#include <util/platform.h>
+
+#include <algorithm>
+#include <cmath>
+
 namespace myobs {
 
 Switcher::Switcher()
@@ -43,6 +48,7 @@ int Switcher::AddInput(obs_source_t *source, const std::string &name)
 	scenes_.push_back(scene);
 	names_.push_back(name);
 	sources_.push_back(source);
+	triggers_.emplace_back();
 	bus_->Add(source, 0x1, true); /* only Мастер-стрим; other buses are switched on by hand */
 	const int index = (int)scenes_.size() - 1;
 	if (index == 0) {
@@ -61,7 +67,18 @@ bool Switcher::RemoveInput(int index)
 	bus_->Remove(sources_[index]);
 	scenes_.erase(scenes_.begin() + index);
 	names_.erase(names_.begin() + index);
+	obs_source_t *gone = sources_[index];
 	sources_.erase(sources_.begin() + index);
+	triggers_.erase(triggers_.begin() + index);
+	/* actions aimed at the removed input are dropped */
+	for (auto &list : triggers_)
+		for (Trigger &t : list)
+			t.actions.erase(std::remove_if(t.actions.begin(), t.actions.end(),
+						       [gone](const TriggerAction &a) { return a.target == gone; }),
+					t.actions.end());
+	scheduled_.erase(std::remove_if(scheduled_.begin(), scheduled_.end(),
+					[gone](const Scheduled &x) { return x.self == gone || x.action.target == gone; }),
+			 scheduled_.end());
 	auto shift = [index](int i) { return i > index ? i - 1 : i; };
 	program_ = shift(program_);
 	preview_ = preview_ == index ? program_.load() : shift(preview_);
@@ -131,6 +148,78 @@ bool Switcher::AudioAfv(int index) const
 	return index >= 0 && index < (int)sources_.size() && bus_->Afv(sources_[index]);
 }
 
+void Switcher::SetTriggers(int index, std::vector<Trigger> triggers)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (index >= 0 && index < (int)triggers_.size())
+		triggers_[index] = std::move(triggers);
+}
+
+std::vector<Trigger> Switcher::Triggers(int index) const
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	return index >= 0 && index < (int)triggers_.size() ? triggers_[index] : std::vector<Trigger>();
+}
+
+void Switcher::SetScreenHandler(std::function<void(const std::string &, int)> handler)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	onScreen_ = std::move(handler);
+}
+
+int Switcher::IndexOf(obs_source_t *s) const
+{
+	for (size_t i = 0; i < sources_.size(); i++)
+		if (sources_[i] == s)
+			return (int)i;
+	return -1;
+}
+
+/* engine thread, mutex held */
+void Switcher::FireTriggers(int oldProgram, int newProgram)
+{
+	if (oldProgram == newProgram)
+		return;
+	const uint64_t now = os_gettime_ns();
+	auto fire = [&](int index, TriggerEvent ev) {
+		if (index < 0 || index >= (int)triggers_.size())
+			return;
+		for (const Trigger &t : triggers_[index])
+			if (t.event == ev)
+				for (const TriggerAction &a : t.actions)
+					scheduled_.push_back({now + (uint64_t)(std::max(0.0, a.delaySec) * 1e9), a,
+							      sources_[index]});
+	};
+	fire(oldProgram, TriggerEvent::OffAir);
+	fire(newProgram, TriggerEvent::OnAir);
+}
+
+/* engine thread, mutex held */
+void Switcher::RunAction(const TriggerAction &a, obs_source_t *self)
+{
+	obs_source_t *target = a.target ? a.target : self;
+	const int index = IndexOf(target);
+	if (index < 0)
+		return;
+	switch (a.kind) {
+	case TriggerAction::Kind::Volume: {
+		const float level = a.level == TriggerAction::Level::Off       ? 0.0f
+				    : a.level == TriggerAction::Level::Restore ? 1.0f
+									   : (float)std::pow(10.0, a.db / 20.0);
+		bus_->SetAutoLevel(target, level, (uint32_t)(std::max(0.0, a.rampSec) * 1000.0), a.fromSilence);
+		break;
+	}
+	case TriggerAction::Kind::GoOnAir:
+		queue_.push_back({Request::Kind::Preview, index, 0});
+		queue_.push_back({a.transitionMs ? Request::Kind::Fade : Request::Kind::Cut, -1, a.transitionMs});
+		break;
+	case TriggerAction::Kind::ShowScreen:
+		if (onScreen_)
+			onScreen_(a.screen, index);
+		break;
+	}
+}
+
 obs_source_t *Switcher::InputScene(int index) const
 {
 	std::lock_guard<std::mutex> lock(mutex_);
@@ -183,6 +272,19 @@ void Switcher::Tick()
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	frame_++;
+	if (!scheduled_.empty()) {
+		const uint64_t now = os_gettime_ns();
+		std::vector<Scheduled> due;
+		for (auto it = scheduled_.begin(); it != scheduled_.end();)
+			if (it->due <= now) {
+				due.push_back(*it);
+				it = scheduled_.erase(it);
+			} else {
+				++it;
+			}
+		for (const Scheduled &x : due)
+			RunAction(x.action, x.self);
+	}
 
 	if (transitioning_) {
 		if (!mix_->Advance())
@@ -223,6 +325,7 @@ void Switcher::Tick()
 			program_ = target;
 			preview_ = old >= 0 ? old : target;
 			bus_->SetPicture(sources_[target], nullptr, 10);
+			FireTriggers(old, target);
 			Emit(Event::Kind::Cut);
 		} else {
 			mix_->StartFade(scene, frames);
@@ -230,6 +333,7 @@ void Switcher::Tick()
 			transitioning_ = true;
 			/* AFV sound crossfades with the picture */
 			bus_->SetPicture(sources_[target], nullptr, r.ms);
+			FireTriggers(program_, target);
 			Emit(Event::Kind::FadeStart);
 		}
 		break; /* one on-air change per frame */

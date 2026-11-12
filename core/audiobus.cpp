@@ -3,6 +3,7 @@
 #include <util/util_uint64.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace myobs {
@@ -227,6 +228,27 @@ bool AudioBus::BusToSink(int bus, const std::string &id) const
 	return it != sinks_.end() && bus >= 0 && bus < kMaxBuses && (it->second.buses & (1u << bus));
 }
 
+void AudioBus::SetAutoLevel(obs_source_t *input, float level, uint32_t rampMs, bool fromSilence)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (Input *in = Find(input)) {
+		if (fromSilence)
+			in->autoGain = 0.0f;
+		in->autoTarget = std::max(0.0f, level);
+		const double samples = std::max(1.0, (double)rampMs * 48.0);
+		in->autoStep = (float)(std::max(1e-6, (double)std::fabs(in->autoTarget - in->autoGain)) / samples);
+		if (rampMs == 0)
+			in->autoGain = in->autoTarget;
+	}
+}
+
+float AudioBus::AutoLevel(obs_source_t *input) const
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	const Input *in = Find(input);
+	return in ? in->autoGain : 0.0f;
+}
+
 void AudioBus::SetPicture(obs_source_t *program, obs_source_t *incoming, uint32_t rampMs)
 {
 	std::lock_guard<std::mutex> lock(mutex_);
@@ -289,7 +311,18 @@ bool AudioBus::Render(uint64_t *tsOut, obs_source_audio_mix *out, uint32_t mixer
 		}
 		const float startGain = in.gain;
 		in.gain = g;
-		if (!timestamp || (startGain == 0.0f && g == 0.0f))
+		/* automation gain (triggers) on top */
+		float a = in.autoGain;
+		const float startAuto = a;
+		for (size_t i = 0; i < AUDIO_OUTPUT_FRAMES; i++) {
+			if (a < in.autoTarget)
+				a = std::min(in.autoTarget, a + in.autoStep);
+			else if (a > in.autoTarget)
+				a = std::max(in.autoTarget, a - in.autoStep);
+			gains[i] *= a;
+		}
+		in.autoGain = a;
+		if (!timestamp || (startGain == 0.0f && g == 0.0f) || (startAuto == 0.0f && a == 0.0f))
 			continue;
 		if (!in.routes && in.sinks.empty())
 			continue;

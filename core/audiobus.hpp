@@ -63,6 +63,11 @@ public:
 	void SetBusToSink(int bus, const std::string &id, bool on);
 	bool BusToSink(int bus, const std::string &id) const;
 
+	// Automation (triggers): a second gain per input, separate from the user's fader.
+	// level: linear gain (1 = «как было»), reached over rampMs; fromSilence starts the ramp at 0.
+	void SetAutoLevel(obs_source_t *input, float level, uint32_t rampMs, bool fromSilence = false);
+	float AutoLevel(obs_source_t *input) const; // current value
+
 	// Picture on air changed: `program` (and `incoming` during a fade) get AFV sound; gains move
 	// over rampMs.
 	void SetPicture(obs_source_t *program, obs_source_t *incoming, uint32_t rampMs);
@@ -80,6 +85,9 @@ private:
 		float gain;   // current
 		float target; // 0 or 1
 		float step;   // per sample
+		float autoGain = 1.0f;
+		float autoTarget = 1.0f;
+		float autoStep = 1.0f;
 	};
 	struct Sink {
 		std::shared_ptr<AudioSink> sink;

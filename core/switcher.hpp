@@ -10,6 +10,7 @@
 
 #include "audiobus.hpp"
 #include "program.hpp"
+#include "triggers.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -56,6 +57,12 @@ public:
 	AudioBus &Audio() { return *bus_; }
 	obs_source_t *InputSource(int index) const; // the input itself (not its scene)
 
+	// Triggers of an input (see triggers.hpp); replaced as a whole.
+	void SetTriggers(int index, std::vector<Trigger> triggers);
+	std::vector<Trigger> Triggers(int index) const;
+	// Called on the engine thread for ShowScreen actions (screen id, input index).
+	void SetScreenHandler(std::function<void(const std::string &, int)> handler);
+
 	// Requests (any thread).
 	void SetPreview(int index);
 	void Cut();
@@ -83,6 +90,17 @@ private:
 	std::unique_ptr<ProgramMix> mix_; // channel 0: the program picture
 	std::unique_ptr<AudioBus> bus_;
 	std::vector<obs_source_t *> sources_; // the inputs themselves (scenes hold the references)
+	std::vector<std::vector<Trigger>> triggers_;
+	struct Scheduled {
+		uint64_t due; // os_gettime_ns
+		TriggerAction action;
+		obs_source_t *self;
+	};
+	std::vector<Scheduled> scheduled_;
+	std::function<void(const std::string &, int)> onScreen_;
+	void FireTriggers(int oldProgram, int newProgram);
+	void RunAction(const TriggerAction &a, obs_source_t *self);
+	int IndexOf(obs_source_t *s) const;
 	std::vector<obs_scene_t *> scenes_;
 	std::vector<std::string> names_;
 	mutable std::mutex mutex_;
