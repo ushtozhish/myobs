@@ -830,6 +830,172 @@ void TestRecording()
 		obs_source_release(s);
 }
 
+/* ---- chaos switching of real clips with sound (the «Клип» input, working codec files) ---- */
+
+std::atomic<float> g_maxStep{0.0f};
+std::atomic<float> g_lastSample{0.0f};
+std::atomic<bool> g_stepArmed{false};
+void OnAudioSteps(void *, size_t, audio_data *data)
+{
+	if (!data || !data->data[0])
+		return;
+	const float *f = (const float *)data->data[0];
+	float last = g_lastSample.load(), maxStep = g_maxStep.load();
+	for (uint32_t i = 0; i < data->frames; i++) {
+		if (g_stepArmed)
+			maxStep = std::max(maxStep, std::fabs(f[i] - last));
+		last = f[i];
+	}
+	g_lastSample = last;
+	g_maxStep = maxStep;
+}
+
+/* records the test pattern of input `id` (sound level `level`) for `sec` seconds into `path` */
+bool MakeClip(const std::string &path, int id, double level, int sec)
+{
+	os_unlink(path.c_str());
+	obs_source_t *src = MakeSoundInput(id, level);
+	bool ok = false;
+	{
+		myobs::Switcher sw;
+		sw.AddInput(src, "clip source");
+		std::this_thread::sleep_for(std::chrono::milliseconds(400));
+		myobs::Recorder rec;
+		myobs::RecordSettings rs;
+		rs.path = path;
+		ok = rec.Start(rs);
+		std::this_thread::sleep_for(std::chrono::seconds(sec));
+		rec.Stop();
+	}
+	obs_source_release(src);
+	return ok && os_file_exists(path.c_str());
+}
+
+void TestClipChaos()
+{
+	if (!obs_source_get_display_name("myobs_clip")) {
+		Check(false, "clip chaos: «Клип» input available");
+		return;
+	}
+	char *dir = os_get_executable_path_ptr("");
+	const std::string base = dir ? dir : "";
+	bfree(dir);
+	const double levels[3] = {0.1, 0.2, 0.3};
+	std::string files[3];
+	for (int i = 0; i < 3; i++) {
+		files[i] = base + "chaos-clip-" + std::to_string(i + 1) + ".mkv";
+		if (!MakeClip(files[i], i + 1, levels[i], 4)) {
+			Check(false, "clip chaos: test clips recorded");
+			return;
+		}
+	}
+	Check(true, "clip chaos: three test clips recorded in the working codec");
+
+	obs_source_t *clips[3] = {};
+	for (int i = 0; i < 3; i++) {
+		obs_data_t *s = obs_data_create();
+		obs_data_set_string(s, "file", files[i].c_str());
+		obs_data_set_bool(s, "loop", true);
+		obs_data_set_int(s, "offair", 0); /* pause, continue from the same frame (vMix) */
+		clips[i] = obs_source_create_private("myobs_clip", ("Chaos clip " + std::to_string(i + 1)).c_str(), s);
+		obs_data_release(s);
+	}
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		g_codes.clear();
+	}
+	g_unreadable = 0;
+	g_maxStep = 0.0f;
+	g_stepArmed = false;
+	std::vector<int> onAir;
+	std::mutex onAirMutex;
+	{
+		myobs::Switcher sw;
+		sw.SetEventCallback([&](const myobs::Switcher::Event &e) {
+			using K = myobs::Switcher::Event::Kind;
+			if (e.kind == K::Cut || e.kind == K::FadeEnd) {
+				std::lock_guard<std::mutex> lock(onAirMutex);
+				onAir.push_back(e.program + 1);
+			}
+		});
+		for (int i = 0; i < 3; i++)
+			sw.AddInput(clips[i], "Clip " + std::to_string(i + 1));
+		std::this_thread::sleep_for(std::chrono::milliseconds(1500)); /* clips open, buffers fill */
+
+		video_scale_info conv = {};
+		conv.format = VIDEO_FORMAT_I420;
+		conv.width = kW;
+		conv.height = kH;
+		conv.range = VIDEO_RANGE_PARTIAL;
+		conv.colorspace = VIDEO_CS_709;
+		obs_add_raw_video_callback(&conv, OnFrame, nullptr);
+		obs_add_raw_audio_callback(0, nullptr, OnAudioSteps, nullptr);
+		std::this_thread::sleep_for(std::chrono::milliseconds(300));
+		g_stepArmed = true;
+		std::mt19937 rng(777);
+		for (int i = 0; i < 60; i++) {
+			sw.SetPreview((int)(rng() % 3));
+			if (i % 5 == 4)
+				sw.Fade(200);
+			else
+				sw.Cut();
+			std::this_thread::sleep_for(std::chrono::milliseconds(30 + rng() % 220));
+		}
+		for (int i = 0; i < 200 && (sw.PendingRequests() || sw.Transitioning()); i++)
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		std::this_thread::sleep_for(std::chrono::milliseconds(400));
+		obs_remove_raw_video_callback(OnFrame, nullptr);
+		obs_remove_raw_audio_callback(0, OnAudioSteps, nullptr);
+	}
+	for (obs_source_t *c : clips)
+		obs_source_release(c);
+
+	std::vector<int> codes;
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		codes = g_codes;
+	}
+	std::vector<int> expected;
+	for (int id : onAir)
+		if (expected.empty() || expected.back() != id)
+			expected.push_back(id);
+	std::vector<int> seen;
+	int empty = 0, foreign = 0, backwards = 0;
+	int lastFrame[4] = {-1, -1, -1, -1};
+	size_t j = 0;
+	for (int c : codes) {
+		const int id = c >> 12, fr = c & 0xFFF;
+		if (id < 1 || id > 3) {
+			empty++;
+			continue;
+		}
+		if (seen.empty() || seen.back() != id) {
+			seen.push_back(id);
+			size_t k = j;
+			while (k < expected.size() && expected[k] != id)
+				k++;
+			if (k == expected.size())
+				foreign++;
+			else
+				j = k + 1;
+		}
+		/* within a clip the frame number only goes forward (a loop restarts near 0) */
+		if (lastFrame[id] >= 0 && fr < lastFrame[id] && fr > 15)
+			backwards++;
+		lastFrame[id] = fr;
+	}
+	std::printf("  [clip chaos] frames %zu, on-air changes %zu, seen %zu, foreign %d, empty %d, blended %d, "
+		    "frame number back %d, largest sound step %.4f\n",
+		    codes.size(), expected.size(), seen.size(), foreign, empty, g_unreadable.load(), backwards,
+		    g_maxStep.load());
+	Check(codes.size() > 100, "clip chaos: output delivers frames");
+	Check(foreign == 0, "clip chaos: no old or foreign clip picture after a switch (no microplan)");
+	Check(empty == 0, "clip chaos: no empty frames");
+	Check(backwards == 0, "clip chaos: a clip continues from its own frame (never jumps back)");
+	/* levels 0.1..0.3 with 10 ms ramps: an honest step is < 0.001; AAC adds a little */
+	Check(g_maxStep.load() < 0.05f, "clip chaos: no clicks in the sound");
+}
+
 void TestRemoveInput()
 {
 	obs_source_t *in[3] = {MakeInput(1), MakeInput(2), MakeInput(3)};
@@ -910,6 +1076,7 @@ int main()
 		TestTriggers();
 		TestScreens();
 		TestRecording();
+		TestClipChaos();
 	} else {
 		Check(false, "engine start");
 	}
