@@ -72,6 +72,9 @@ public:
 	// over rampMs.
 	void SetPicture(obs_source_t *program, obs_source_t *incoming, uint32_t rampMs);
 
+	// Tests: log every input's part of the tick when the Мастер-стрим mix jumps by more than this (0 = off).
+	static void SetDebugStep(float threshold);
+
 	// Called by the router source (audio thread).
 	bool Render(uint64_t *tsOut, obs_source_audio_mix *out, uint32_t mixers, size_t channels, size_t sampleRate);
 	void Enum(obs_source_enum_proc_t cb, void *param);
