@@ -32,6 +32,7 @@
 #include <vector>
 #include <random>
 
+#include "screenfeeds.hpp"
 #include "switcher.hpp"
 
 namespace {
@@ -639,6 +640,35 @@ void TestTriggers()
 		obs_source_release(s);
 }
 
+/* ---- screen outputs: an input on a screen runs independently of the program ---- */
+
+void TestScreens()
+{
+	obs_source_t *in[2] = {MakeInput(1), MakeInput(2)};
+	{
+		myobs::Switcher sw;
+		sw.AddInput(in[0], "Studio");
+		sw.AddInput(in[1], "Clip on screen");
+		std::this_thread::sleep_for(std::chrono::milliseconds(300));
+		Check(obs_source_active(in[0]) && !obs_source_active(in[1]), "screens: only the program input is active at first");
+		{
+			myobs::ScreenFeeds screens;
+			screens.Show("LED", myobs::ScreenFeeds::Kind::Input, sw.InputScene(1));
+			screens.Show("Hall", myobs::ScreenFeeds::Kind::Input, sw.InputScene(1));
+			Check(obs_source_active(in[1]), "screens: an input shown on a screen runs (active) while off air");
+			Check(sw.Program() == 0, "screens: the program is not changed by a screen");
+			screens.Show("LED", myobs::ScreenFeeds::Kind::Program);
+			Check(obs_source_active(in[1]), "screens: still running while on the other screen");
+			screens.Show("Hall", myobs::ScreenFeeds::Kind::Off);
+			Check(!obs_source_active(in[1]), "screens: released when on no screen");
+			screens.Show("Hall", myobs::ScreenFeeds::Kind::Input, sw.InputScene(0));
+		}
+		Check(obs_source_active(in[0]), "screens: the program input stays active after its screen is gone");
+	}
+	for (obs_source_t *s : in)
+		obs_source_release(s);
+}
+
 void TestRemoveInput()
 {
 	obs_source_t *in[3] = {MakeInput(1), MakeInput(2), MakeInput(3)};
@@ -717,6 +747,7 @@ int main()
 		TestAudio();
 		TestRouting();
 		TestTriggers();
+		TestScreens();
 	} else {
 		Check(false, "engine start");
 	}

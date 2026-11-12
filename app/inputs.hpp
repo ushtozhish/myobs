@@ -17,6 +17,7 @@
 #include "props.hpp"
 #include "switcher.hpp"
 #include "thumbs.hpp"
+#include "screens.hpp"
 #include "triggers_ui.hpp"
 
 #include <QGuiApplication>
@@ -345,6 +346,10 @@ public:
 		mixer->setToolTip("Маршрутизация звука: входы и шины → шины и звуковые устройства");
 		connect(mixer, &QPushButton::clicked, this, [this]() { MixerDialog(); });
 		bar->addWidget(mixer);
+		auto *screensBtn = new QPushButton("Экраны", this);
+		screensBtn->setToolTip("Вывод входов, Program или Preview во весь экран на мониторы и LED");
+		connect(screensBtn, &QPushButton::clicked, this, [this]() { screens_->Dialog(this); });
+		bar->addWidget(screensBtn);
 		bar->addStretch();
 		status_ = new QLabel(this);
 		status_->setObjectName("switchStatus");
@@ -382,11 +387,26 @@ public:
 		RestoreTabs();
 		RestoreInputs();
 		RestoreBusSends();
+		screens_ = std::make_unique<ScreenOutputs>(sw_, [this]() {
+			QStringList n;
+			for (const Input &in : inputs_)
+				n << in.name;
+			return n;
+		});
+		screens_->Restore();
+		/* trigger «Экран: показать» comes from the engine thread */
+		sw_->SetScreenHandler([this](const std::string &screen, int index) {
+			const QString id = QString::fromStdString(screen);
+			QMetaObject::invokeMethod(this, [this, id, index]() { screens_->Set(id, ScreenOutputs::Kind::Input, index); },
+						  Qt::QueuedConnection);
+		});
 		RebuildTiles();
 	}
 
 	~InputsPanel() override
 	{
+		sw_->SetScreenHandler(nullptr);
+		screens_.reset();
 		for (InputTile *t : tiles_)
 			delete t;
 		tiles_.clear();
@@ -816,6 +836,7 @@ private:
 		}
 		ClearTiles(); /* tiles use the input's audio and display: drop them first */
 		inputs_.erase(inputs_.begin() + index);
+		screens_->InputRemoved(index);
 		RebuildTiles();
 		SaveInputs();
 	}
@@ -1212,5 +1233,6 @@ private:
 	QLabel *status_ = nullptr;
 	int columns_ = 0;
 	std::map<QString, std::shared_ptr<myobs::DeviceSink>> sinks_;
+	std::unique_ptr<ScreenOutputs> screens_;
 	bool restoringTabs_ = false;
 };
