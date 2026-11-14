@@ -164,7 +164,7 @@ public:
 	}
 
 	/* Samples [pos, pos + n); missing ones are silence. Returns false if any was missing. */
-	bool Read(int64_t pos, int n, float *l, float *r)
+	bool Read(int64_t pos, int n, float *l, float *r, uint8_t *have = nullptr)
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		const int64_t end = start_ + (int64_t)left_.size();
@@ -174,9 +174,13 @@ public:
 			if (p >= start_ && p < end) {
 				l[i] = left_[(size_t)(p - start_)];
 				r[i] = right_[(size_t)(p - start_)];
+				if (have)
+					have[i] = 1;
 			} else {
 				l[i] = r[i] = 0.0f;
 				complete = false;
+				if (have)
+					have[i] = 0;
 			}
 		}
 		return complete;
@@ -543,7 +547,11 @@ public:
 			return;
 		left_.resize((size_t)n);
 		right_.resize((size_t)n);
-		audio_.Read(pos, (int)n, left_.data(), right_.data());
+		have_.resize((size_t)n);
+		if (!audio_.Read(pos, (int)n, left_.data(), right_.data(), have_.data()))
+			SmoothGaps((size_t)n);
+		else
+			haveLast_ = true;
 		if (fade > 0) {
 			const int64_t len = std::min<int64_t>(n, sampleRate_ / 200);
 			for (int64_t i = 0; i < len; i++) {
@@ -569,6 +577,47 @@ public:
 				q.erase(q.begin(), q.begin() + (std::ptrdiff_t)(q.size() - cap));
 			ringFadeIn_ = true;
 		}
+	}
+
+	/* Samples the decoder does not have yet (just after a jump, or it fell behind) are silence:
+	 * fade the sound out before such a gap and in after it - no hard edge. */
+	void SmoothGaps(size_t n)
+	{
+		constexpr size_t kEdge = 64;
+		bool prev = haveLast_;
+		for (size_t i = 0; i < n; i++) {
+			const bool h = have_[i] != 0;
+			if (prev && !h) { /* sound -> gap: fade out what came before */
+				if (i >= kEdge) {
+					for (size_t k = 0; k < kEdge; k++) {
+						const float g = (float)(k + 1) / (float)kEdge;
+						left_[i - 1 - k] *= g;
+						right_[i - 1 - k] *= g;
+					}
+				} else { /* partly in the ring already */
+					std::lock_guard<std::mutex> lock(ringMutex_);
+					for (size_t k = 0; k < kEdge; k++) {
+						const float g = (float)(k + 1) / (float)kEdge;
+						if (k < i) {
+							left_[i - 1 - k] *= g;
+							right_[i - 1 - k] *= g;
+						} else if (k - i < ring_[0].size()) {
+							const size_t j = ring_[0].size() - 1 - (k - i);
+							ring_[0][j] *= g;
+							ring_[1][j] *= g;
+						}
+					}
+				}
+			} else if (!prev && h) { /* gap -> sound: fade in */
+				for (size_t k = 0; k < kEdge && i + k < n; k++) {
+					const float g = (float)(k + 1) / (float)kEdge;
+					left_[i + k] *= g;
+					right_[i + k] *= g;
+				}
+			}
+			prev = h;
+		}
+		haveLast_ = prev;
 	}
 
 	/* The clip's sound for one engine tick: exactly 1024 samples from the ring, at the start of
@@ -1042,6 +1091,8 @@ private:
 	bool fadeIn_ = true;
 	bool wasPlaying_ = false;
 	std::vector<float> left_, right_;
+	std::vector<uint8_t> have_;
+	bool haveLast_ = false; /* the last sample emitted was real sound */
 	static constexpr int64_t kPrime = 2048;           /* samples waiting before the sound starts */
 	static constexpr int64_t kLead = kPrime + 1024;   /* ring + the router's one tick of look-ahead */
 	obs_source_t *sound_ = nullptr; /* the companion that gives the sound to the engine */
