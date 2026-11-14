@@ -65,10 +65,18 @@ void RegisterBus()
 std::mutex g_peakMutex;
 std::map<obs_source_t *, float> g_peaks;
 
-/* renders its own sound tick by tick (no timestamp of its own: always at the start of the tick) */
-bool SelfRendering(obs_source_t *s)
+/* the self-rendering sound source of an input (a clip), referenced, or null */
+obs_source_t *SoundSourceOf(obs_source_t *s)
 {
-	return (obs_source_get_output_flags(s) & OBS_SOURCE_COMPOSITE) != 0;
+	proc_handler_t *ph = obs_source_get_proc_handler(s);
+	if (!ph)
+		return nullptr;
+	calldata_t cd = {};
+	obs_source_t *sound = nullptr;
+	if (proc_handler_call(ph, "get_sound_source", &cd))
+		sound = static_cast<obs_source_t *>(calldata_ptr(&cd, "source"));
+	calldata_free(&cd);
+	return sound ? obs_source_get_ref(sound) : nullptr;
 }
 
 } // namespace
@@ -124,8 +132,10 @@ AudioBus::~AudioBus()
 	{
 		/* empty first: taking the router out must not deactivate inputs it never activated */
 		std::lock_guard<std::mutex> lock(mutex_);
-		for (Input &in : inputs_)
+		for (Input &in : inputs_) {
+			obs_source_release(in.sound);
 			obs_source_release(in.source);
+		}
 		inputs_.clear();
 		sinks_.clear();
 	}
@@ -177,6 +187,7 @@ void AudioBus::Add(obs_source_t *input, uint32_t routes, bool afv)
 	if (Find(input))
 		return;
 	inputs_.push_back({obs_source_get_ref(input), routes, afv, {}, 0.0f, 0.0f, 1.0f});
+	inputs_.back().sound = SoundSourceOf(input);
 	Retarget(inputs_.back(), 10, 48000);
 	inputs_.back().gain = inputs_.back().target;
 }
@@ -190,6 +201,7 @@ void AudioBus::Remove(obs_source_t *input)
 				std::lock_guard<std::mutex> pl(g_peakMutex);
 				g_peaks.erase(it->source);
 			}
+			obs_source_release(it->sound);
 			obs_source_release(it->source);
 			inputs_.erase(it);
 			return;
@@ -310,8 +322,11 @@ void AudioBus::SetPicture(obs_source_t *program, obs_source_t *incoming, uint32_
 void AudioBus::Enum(obs_source_enum_proc_t cb, void *param)
 {
 	std::lock_guard<std::mutex> lock(mutex_);
-	for (Input &in : inputs_)
+	for (Input &in : inputs_) {
 		cb(bus_, in.source, param);
+		if (in.sound) /* so libobs renders the clip's sound each tick */
+			cb(bus_, in.sound, param);
+	}
 }
 
 namespace {
@@ -330,7 +345,7 @@ bool AudioBus::Render(uint64_t *tsOut, obs_source_audio_mix *out, uint32_t mixer
 
 	uint64_t timestamp = 0;
 	for (Input &in : inputs_) {
-		if (SelfRendering(in.source) || obs_source_audio_pending(in.source))
+		if (in.sound || obs_source_audio_pending(in.source))
 			continue;
 		const uint64_t t = obs_source_get_audio_timestamp(in.source);
 		if (t && (!timestamp || t < timestamp))
@@ -409,22 +424,32 @@ bool AudioBus::Render(uint64_t *tsOut, obs_source_audio_mix *out, uint32_t mixer
 			gains[i] *= a;
 		}
 		in.autoGain = a;
+		/* a self-rendering sound gets the input's fader here (libobs applied it to queued sound) */
+		obs_source_t *const audioSrc = in.sound ? in.sound : in.source;
+		float vol = 1.0f;
+		if (in.sound) {
+			vol = obs_source_muted(in.source) ? 0.0f : obs_source_get_volume(in.source);
+			const float v0 = in.vol < 0.0f ? vol : in.vol;
+			for (size_t i = 0; i < N; i++)
+				gains[i] *= v0 + (vol - v0) * (float)(i + 1) / (float)N;
+			in.vol = vol;
+		}
 
 		/* 1. this tick of the input -> held for the next call */
 		for (auto &c : cur)
 			c.assign(N, 0.0f);
 		bool present = false;
 		size_t offset = 0;
-		const bool pending = obs_source_audio_pending(in.source);
+		const bool pending = obs_source_audio_pending(audioSrc);
 		const bool audible = !((startGain == 0.0f && g == 0.0f) || (startAuto == 0.0f && a == 0.0f));
 		if (haveSound && !pending && audible && (in.routes || !in.sinks.empty())) {
-			const bool self = SelfRendering(in.source);
+			const bool self = in.sound != nullptr; /* always at the start of the tick */
 			const uint64_t t = self ? timestamp : obs_source_get_audio_timestamp(in.source);
 			if (t && t >= timestamp) {
 				offset = (size_t)util_mul_div64(t - timestamp, sampleRate, 1000000000ULL);
 				if (offset < N) {
 					/* the input's own sound (fader applied) is in mix 0, which is always prepared */
-					obs_source_get_audio_mix(in.source, &mix);
+					obs_source_get_audio_mix(audioSrc, &mix);
 					for (size_t c = 0; c < ch; c++) {
 						const float *src = mix.output[0].data[c];
 						if (!src)
@@ -443,7 +468,7 @@ bool AudioBus::Render(uint64_t *tsOut, obs_source_audio_mix *out, uint32_t mixer
 									peak = std::max(peak, std::fabs(src[i]));
 						std::lock_guard<std::mutex> pl(g_peakMutex);
 						float &pk = g_peaks[in.source];
-						pk = std::max(pk, peak);
+						pk = std::max(pk, peak * vol);
 					}
 					if (offset) /* sound starting inside the tick: soft start */
 						for (size_t i = 0; i < kEdge && offset + i < N; i++)

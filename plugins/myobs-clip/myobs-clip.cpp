@@ -334,6 +334,13 @@ private:
 	int64_t start_ = 0; /* sample number of left_[0] */
 };
 
+class Clip;
+/* clip <-> its sound source (the source outlives the clip while the router holds it) */
+struct SoundLink {
+	std::mutex m;
+	Clip *clip;
+};
+
 class Clip {
 public:
 	explicit Clip(obs_source_t *source) : source_(source)
@@ -348,9 +355,31 @@ public:
 					 calldata_set_string(cd, "text", text.c_str());
 				 },
 				 this);
+		auto *link = new SoundLink{{}, this};
+		obs_data_t *s = obs_data_create();
+		obs_data_set_int(s, "link", (long long)(uintptr_t)link);
+		sound_ = obs_source_create_private("myobs_clip_sound", "MyOBS clip sound", s);
+		obs_data_release(s);
+		if (sound_)
+			link_ = link;
+		else
+			delete link;
+		proc_handler_add(obs_source_get_proc_handler(source_), "void get_sound_source(out ptr source)",
+				 [](void *data, calldata_t *cd) {
+					 calldata_set_ptr(cd, "source", static_cast<Clip *>(data)->sound_);
+				 },
+				 this);
 	}
 
-	~Clip() { Close(); }
+	~Clip()
+	{
+		if (link_) {
+			std::lock_guard<std::mutex> lock(link_->m);
+			link_->clip = nullptr;
+		}
+		obs_source_release(sound_);
+		Close();
+	}
 
 	/* ---- settings ---- */
 
@@ -1015,6 +1044,8 @@ private:
 	std::vector<float> left_, right_;
 	static constexpr int64_t kPrime = 2048;           /* samples waiting before the sound starts */
 	static constexpr int64_t kLead = kPrime + 1024;   /* ring + the router's one tick of look-ahead */
+	obs_source_t *sound_ = nullptr; /* the companion that gives the sound to the engine */
+	SoundLink *link_ = nullptr;     /* owned by sound_ */
 	std::mutex ringMutex_;
 	std::deque<float> ring_[2];
 	bool primed_ = false;
@@ -1114,8 +1145,7 @@ bool obs_module_load(void)
 	obs_source_info info = {};
 	info.id = "myobs_clip";
 	info.type = OBS_SOURCE_TYPE_INPUT;
-	/* COMPOSITE + audio_render: the clip renders its own sound tick by tick (see AudioRender) */
-	info.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_COMPOSITE | OBS_SOURCE_DO_NOT_DUPLICATE |
+	info.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO | OBS_SOURCE_DO_NOT_DUPLICATE |
 			    OBS_SOURCE_CONTROLLABLE_MEDIA;
 	info.get_name = GetName;
 	info.create = Create;
@@ -1134,10 +1164,27 @@ bool obs_module_load(void)
 	info.media_get_time = [](void *data) { return static_cast<Clip *>(data)->TimeMs(); };
 	info.media_set_time = [](void *data, int64_t ms) { static_cast<Clip *>(data)->SetTimeMs(ms); };
 	info.media_get_state = [](void *data) { return static_cast<Clip *>(data)->State(); };
-	info.audio_render = [](void *data, uint64_t *ts, obs_source_audio_mix *out, uint32_t mixers, size_t channels,
-			       size_t) { return static_cast<Clip *>(data)->AudioRender(ts, out, mixers, channels); };
 	info.icon_type = OBS_ICON_TYPE_MEDIA;
 	obs_register_source(&info);
+
+	/* The clip's sound: a private companion (composite + audio_render; libobs refuses composite
+	 * async sources) that the router takes from the clip ("get_sound_source"). */
+	obs_source_info sound = {};
+	sound.id = "myobs_clip_sound";
+	sound.type = OBS_SOURCE_TYPE_INPUT;
+	sound.output_flags = OBS_SOURCE_COMPOSITE | OBS_SOURCE_CAP_DISABLED;
+	sound.get_name = [](void *) { return "MyOBS clip sound"; };
+	sound.create = [](obs_data_t *settings, obs_source_t *) -> void * {
+		return reinterpret_cast<void *>((uintptr_t)obs_data_get_int(settings, "link"));
+	};
+	sound.destroy = [](void *data) { delete static_cast<SoundLink *>(data); };
+	sound.audio_render = [](void *data, uint64_t *ts, obs_source_audio_mix *out, uint32_t mixers, size_t channels,
+				size_t) {
+		auto *link = static_cast<SoundLink *>(data);
+		std::lock_guard<std::mutex> lock(link->m);
+		return link->clip ? link->clip->AudioRender(ts, out, mixers, channels) : false;
+	};
+	obs_register_source(&sound);
 	blog(LOG_INFO, "[MyOBS Clip] loaded");
 	return true;
 }

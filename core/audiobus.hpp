@@ -44,11 +44,12 @@ public:
 	virtual void Push(const float *l, const float *r, size_t frames) = 0; /* engine audio thread */
 };
 
-/* A source has sound for the router: a normal audio source, or a composite that renders its own
- * sound tick by tick (the clip: its sound bypasses the libobs queue, which dropped pieces of it). */
+/* A source has sound for the router. (A clip renders its sound itself, tick by tick, through a
+ * companion source it hands out with the proc "get_sound_source" - the libobs queue dropped
+ * pieces of it. The clip's fader still applies.) */
 inline bool SourceHasAudio(obs_source_t *s)
 {
-	return s && (obs_source_get_output_flags(s) & (OBS_SOURCE_AUDIO | OBS_SOURCE_COMPOSITE)) != 0;
+	return s && (obs_source_get_output_flags(s) & OBS_SOURCE_AUDIO) != 0;
 }
 
 class AudioBus {
@@ -109,6 +110,8 @@ private:
 		/* one tick of look-ahead (edges without clicks): the tick being output and whether the
 		 * input had sound in the tick before it */
 		std::vector<float> held[2];
+		obs_source_t *sound = nullptr; // referenced: the clip's self-rendering sound source
+		float vol = -1.0f;             // the fader applied to `sound` (last tick)
 		bool heldPresent = false;
 		bool beforePresent = false;
 	};
