@@ -2,6 +2,8 @@
 
 **English** · [Русский](README.ru.md)
 
+<a href="#️-support-the-dev"><img src="docs/support/badge-en.svg" height="30" alt="❤ Support the dev"></a>
+
 **A live production switcher for Windows: vMix-style switching, broadcast-hardware reliability.**
 
 > Status: **in development** (stage 1 of 5). The images below are **interface concepts**, not
@@ -73,6 +75,18 @@ pwsh ci/build-engine.ps1
 pwsh ci/build-app.ps1
 pwsh ci/run-tests.ps1
 ```
+
+## ❤️ Support the dev
+
+<a href="https://ushtozhish.github.io/support/"><img src="docs/support/support-en.svg" width="880" alt="Support the dev — Kaspi, page with a copy button"></a>
+
+> [!TIP]
+> Free and open source. If it helped you, chip in what you like — a voluntary gift, nothing in return, the tool stays free for everyone.
+>
+> - 🇰🇿 **Kaspi:** `4400 4303 6234 6964` (Artem V. — check the name before sending)
+> - 📱 **Page with a copy button:** https://ushtozhish.github.io/support/
+>
+> 🇷🇺 **Поддержи по-братски:** Kaspi `4400 4303 6234 6964` (проверь имя: Артём В.). Добровольно и безвозмездно. · 🇰🇿 **Бауырша қолда:** [қолдау беті](https://ushtozhish.github.io/support/)
 
 ## License
 

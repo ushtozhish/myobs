@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="222" height="30" viewBox="0 0 222 30" role="img" aria-label="Поддержи по-братски">
+<rect width="222" height="30" rx="15" fill="#f5a33b"/>
+<path d="M0 6.2C0 2.8 2.6 0 5.8 0c2 0 3.6 1 4.7 2.6C11.6 1 13.2 0 15.2 0 18.4 0 21 2.8 21 6.2c0 6.3-8.4 11.6-10.5 12.8C8.4 17.8 0 12.5 0 6.2z" transform="translate(13 9) scale(.62)" fill="#1a1209"/>
+<text x="122.0" y="20" font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif" font-size="14" font-weight="700" fill="#1a1209" text-anchor="middle">Поддержи по-братски</text>
+</svg>
