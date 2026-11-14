@@ -47,6 +47,8 @@ extern "C" {
 #include <algorithm>
 #include <map>
 #include <set>
+#include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -470,7 +472,8 @@ public:
 	{
 		if (!audio_.Has())
 			return;
-		const int64_t target = (int64_t)std::floor(t * sampleRate_);
+		/* the sound runs kLead ahead of the picture: that much waits in the ring and the router */
+		const int64_t target = (int64_t)std::floor(t * sampleRate_) + kLead;
 		audio_.SetWant(target);
 		const int64_t n = target - audioPos_;
 		if (!playing) {
@@ -480,7 +483,6 @@ public:
 			if (wasPlaying_)
 				Emit(audioPos_, 2048, -2);
 			wasPlaying_ = false;
-			restart_ = true; /* the next start anchors a new sound timeline (never before the tail's end) */
 			audioPos_ = target;
 			fadeIn_ = true;
 			return;
@@ -528,36 +530,82 @@ public:
 				right_[(size_t)i] *= g;
 			}
 		}
-		obs_source_audio a = {};
-		a.data[0] = reinterpret_cast<const uint8_t *>(left_.data());
-		a.data[1] = reinterpret_cast<const uint8_t *>(right_.data());
-		a.frames = (uint32_t)n;
-		a.speakers = SPEAKERS_STEREO;
-		a.format = AUDIO_FORMAT_FLOAT_PLANAR;
-		a.samples_per_sec = sampleRate_;
-		/* Continuous sound timeline: each chunk starts exactly where the previous one ended
-		 * (counted in samples), anchored to the clock only at a start after a stop, or when the
-		 * count and the clock drift apart by more than 40 ms. Jittery clock stamps made libobs
-		 * place chunks off by a few samples - a gap or overlap inside a tick: a click. */
-		const uint64_t dur = (uint64_t)n * 1000000000ULL / sampleRate_;
-		const uint64_t clock = os_gettime_ns() - dur;
-		/* Never back in time: libobs answers an earlier stamp by throwing away what it still holds
-		 * of this source - the faded tail of a stop - and the sound breaks off at full level. */
-		if (!tsValid_) {
-			nextTs_ = clock;
-			tsValid_ = true;
-		} else if (restart_) {
-			nextTs_ = std::max(nextTs_, clock);
-		} else if ((int64_t)(clock - nextTs_) > 40000000LL) {
-			nextTs_ = clock; /* behind the clock: forward only */
-		} else if ((int64_t)(nextTs_ - clock) > 120000000LL) {
-			nextTs_ = clock; /* far ahead (clock jump): the only backward re-anchor */
+		/* into the ring; the engine's audio thread takes it out tick by tick (AudioRender) */
+		std::lock_guard<std::mutex> lock(ringMutex_);
+		ring_[0].insert(ring_[0].end(), left_.begin(), left_.end());
+		ring_[1].insert(ring_[1].end(), right_.begin(), right_.end());
+		const size_t cap = (size_t)sampleRate_ * 2; /* nobody takes the sound (not in the router) */
+		if (ring_[0].size() > cap) {
+			for (auto &q : ring_)
+				q.erase(q.begin(), q.begin() + (std::ptrdiff_t)(q.size() - cap));
+			ringFadeIn_ = true;
 		}
-		restart_ = false;
-		a.timestamp = nextTs_;
-		nextTs_ += dur;
-		obs_source_output_audio(source_, &a);
 	}
+
+	/* The clip's sound for one engine tick: exactly 1024 samples from the ring, at the start of
+	 * the tick. libobs' own queue (obs_source_output_audio) placed and dropped pieces of the
+	 * sound by timestamps - the clicks; this way nothing is placed or dropped. The ring is filled
+	 * by the video tick and starts giving sound once kPrime samples wait (absorbs frame jitter). */
+	bool AudioRender(uint64_t *ts, obs_source_audio_mix *out, uint32_t mixers, size_t channels)
+	{
+		constexpr size_t N = AUDIO_OUTPUT_FRAMES;
+		constexpr size_t kEdge = 64;
+		float l[N] = {}, r[N] = {};
+		size_t got = 0;
+		bool fadeIn = false;
+		{
+			std::lock_guard<std::mutex> lock(ringMutex_);
+			size_t avail = ring_[0].size();
+			if (avail > (size_t)kPrime + 8 * N) { /* nobody took the sound for a while: drop the backlog */
+				const size_t drop = avail - (size_t)kPrime;
+				for (auto &q : ring_)
+					q.erase(q.begin(), q.begin() + (std::ptrdiff_t)drop);
+				avail = ring_[0].size();
+				ringFadeIn_ = true;
+			}
+			if (!primed_) {
+				if (avail < (size_t)kPrime)
+					return false;
+				primed_ = true;
+				fadeIn = ringFadeIn_;
+				ringFadeIn_ = false;
+			}
+			got = std::min(avail, N);
+			std::copy(ring_[0].begin(), ring_[0].begin() + (std::ptrdiff_t)got, l);
+			std::copy(ring_[1].begin(), ring_[1].begin() + (std::ptrdiff_t)got, r);
+			for (auto &q : ring_)
+				q.erase(q.begin(), q.begin() + (std::ptrdiff_t)got);
+			if (got < N) { /* ran dry: what there is fades out, sound starts again once primed */
+				primed_ = false;
+				ringFadeIn_ = true;
+				const size_t len = std::min(got, kEdge);
+				for (size_t i = 0; i < len; i++) {
+					const float g = 1.0f - (float)(i + 1) / (float)len;
+					l[got - len + i] *= g;
+					r[got - len + i] *= g;
+				}
+			}
+		}
+		if (!got)
+			return false;
+		if (fadeIn)
+			for (size_t i = 0; i < kEdge; i++) {
+				const float g = (float)(i + 1) / (float)kEdge;
+				l[i] *= g;
+				r[i] *= g;
+			}
+		for (size_t m = 0; m < MAX_AUDIO_MIXES; m++) {
+			if (!(mixers & (1u << m)))
+				continue;
+			for (size_t c = 0; c < channels; c++)
+				if (float *d = out->output[m].data[c])
+					std::memcpy(d, c == 1 ? r : (c == 0 ? l : r), sizeof(float) * N);
+		}
+		/* any non-zero value: the router puts a self-rendering input at the start of the tick */
+		*ts = os_gettime_ns();
+		return true;
+	}
+
 
 	/* For the switch test: "decoder, decoded, shown, late". */
 	std::string Stats() const
@@ -964,10 +1012,13 @@ private:
 	int64_t audioPos_ = 0;
 	bool fadeIn_ = true;
 	bool wasPlaying_ = false;
-	bool tsValid_ = false;
-	uint64_t nextTs_ = 0;
-	bool restart_ = false;
 	std::vector<float> left_, right_;
+	static constexpr int64_t kPrime = 2048;           /* samples waiting before the sound starts */
+	static constexpr int64_t kLead = kPrime + 1024;   /* ring + the router's one tick of look-ahead */
+	std::mutex ringMutex_;
+	std::deque<float> ring_[2];
+	bool primed_ = false;
+	bool ringFadeIn_ = true;
 
 	/* playback (play_) */
 	std::mutex play_;
@@ -1063,7 +1114,8 @@ bool obs_module_load(void)
 	obs_source_info info = {};
 	info.id = "myobs_clip";
 	info.type = OBS_SOURCE_TYPE_INPUT;
-	info.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO | OBS_SOURCE_DO_NOT_DUPLICATE |
+	/* COMPOSITE + audio_render: the clip renders its own sound tick by tick (see AudioRender) */
+	info.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_COMPOSITE | OBS_SOURCE_DO_NOT_DUPLICATE |
 			    OBS_SOURCE_CONTROLLABLE_MEDIA;
 	info.get_name = GetName;
 	info.create = Create;
@@ -1082,6 +1134,8 @@ bool obs_module_load(void)
 	info.media_get_time = [](void *data) { return static_cast<Clip *>(data)->TimeMs(); };
 	info.media_set_time = [](void *data, int64_t ms) { static_cast<Clip *>(data)->SetTimeMs(ms); };
 	info.media_get_state = [](void *data) { return static_cast<Clip *>(data)->State(); };
+	info.audio_render = [](void *data, uint64_t *ts, obs_source_audio_mix *out, uint32_t mixers, size_t channels,
+			       size_t) { return static_cast<Clip *>(data)->AudioRender(ts, out, mixers, channels); };
 	info.icon_type = OBS_ICON_TYPE_MEDIA;
 	obs_register_source(&info);
 	blog(LOG_INFO, "[MyOBS Clip] loaded");

@@ -76,7 +76,7 @@
 
 class InputAudio {
 public:
-	explicit InputAudio(obs_source_t *source)
+	explicit InputAudio(obs_source_t *source) : source_(source)
 	{
 		meter_ = obs_volmeter_create(OBS_FADER_LOG);
 		obs_volmeter_attach_source(meter_, source);
@@ -91,7 +91,15 @@ public:
 		obs_fader_destroy(fader_);
 	}
 	/* highest peak since the last call, dBFS */
-	float TakePeakDb() { return peak_.exchange(-100.0f); }
+	float TakePeakDb()
+	{
+		float db = peak_.exchange(-100.0f);
+		/* a clip renders its own sound: its meter comes from the router */
+		const float lin = myobs::AudioBus::TakeInputPeak(source_);
+		if (lin > 0.0f)
+			db = std::max(db, 20.0f * std::log10(lin));
+		return db;
+	}
 	float Deflection() const { return obs_fader_get_deflection(fader_); }
 	void SetDeflection(float d) { obs_fader_set_deflection(fader_, d); }
 
@@ -106,6 +114,7 @@ private:
 		while (p > prev && !self->peak_.compare_exchange_weak(prev, p)) {
 		}
 	}
+	obs_source_t *source_ = nullptr;
 	obs_volmeter_t *meter_ = nullptr;
 	obs_fader_t *fader_ = nullptr;
 	std::atomic<float> peak_{-100.0f};
@@ -547,7 +556,7 @@ private:
 			return false;
 		}
 		obs_source_set_volume(src, (float)volume);
-		const bool hasAudio = (obs_source_get_output_flags(src) & OBS_SOURCE_AUDIO) != 0;
+		const bool hasAudio = myobs::SourceHasAudio(src);
 		const int index = sw_->AddInput(src, name.toStdString());
 		for (int b = 0; b < 3; b++)
 			sw_->SetAudioRoute(index, b, (routes >> b) & 1u);
@@ -641,7 +650,7 @@ private:
 	void RefreshAudio(int index)
 	{
 		Input &in = inputs_[index];
-		const bool hasAudio = (obs_source_get_output_flags(in.source) & OBS_SOURCE_AUDIO) != 0;
+		const bool hasAudio = myobs::SourceHasAudio(in.source);
 		if (hasAudio && !in.audio) {
 			ClearTiles();
 			in.audio = std::make_unique<InputAudio>(in.source);

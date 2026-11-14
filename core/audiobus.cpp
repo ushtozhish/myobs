@@ -1,5 +1,6 @@
 #include "audiobus.hpp"
 
+#include <util/platform.h>
 #include <util/util_uint64.h>
 
 #include <algorithm>
@@ -47,9 +48,41 @@ void RegisterBus()
 			link->bus->Enum(cb, param);
 	};
 	obs_register_source(&info);
+
+	/* The clock: a silent queued audio source, fed one tick per router tick. libobs lines its
+	 * timestamp up with the start of every tick - the router's time when only self-rendering
+	 * inputs (clips) have sound. */
+	obs_source_info clock = {};
+	clock.id = "myobs_audio_clock";
+	clock.type = OBS_SOURCE_TYPE_INPUT;
+	clock.output_flags = OBS_SOURCE_AUDIO | OBS_SOURCE_CAP_DISABLED;
+	clock.get_name = [](void *) { return "MyOBS audio clock"; };
+	clock.create = [](obs_data_t *, obs_source_t *) -> void * { return reinterpret_cast<void *>(1); };
+	clock.destroy = [](void *) {};
+	obs_register_source(&clock);
+}
+
+std::mutex g_peakMutex;
+std::map<obs_source_t *, float> g_peaks;
+
+/* renders its own sound tick by tick (no timestamp of its own: always at the start of the tick) */
+bool SelfRendering(obs_source_t *s)
+{
+	return (obs_source_get_output_flags(s) & OBS_SOURCE_COMPOSITE) != 0;
 }
 
 } // namespace
+
+float AudioBus::TakeInputPeak(obs_source_t *input)
+{
+	std::lock_guard<std::mutex> lock(g_peakMutex);
+	auto it = g_peaks.find(input);
+	if (it == g_peaks.end())
+		return 0.0f;
+	const float p = it->second;
+	it->second = 0.0f;
+	return p;
+}
 
 void AudioBus::SetDebugStep(float threshold)
 {
@@ -81,6 +114,7 @@ AudioBus::AudioBus()
 	obs_add_raw_audio_callback(0, nullptr, KeepMixActive, this);
 	/* Into the output while empty: the router is activated with no children, so inputs are never
 	 * activated by it (their activation stays with the picture on air). */
+	clock_ = obs_source_create_private("myobs_audio_clock", "MyOBS audio clock", nullptr);
 	if (bus_)
 		obs_set_output_source(1, bus_);
 }
@@ -105,6 +139,7 @@ AudioBus::~AudioBus()
 		}
 		obs_source_release(bus_);
 	}
+	obs_source_release(clock_);
 }
 
 AudioBus::Input *AudioBus::Find(obs_source_t *s)
@@ -136,7 +171,7 @@ void AudioBus::Retarget(Input &in, uint32_t rampMs, size_t sampleRate)
 
 void AudioBus::Add(obs_source_t *input, uint32_t routes, bool afv)
 {
-	if (!input || !(obs_source_get_output_flags(input) & OBS_SOURCE_AUDIO))
+	if (!SourceHasAudio(input))
 		return;
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (Find(input))
@@ -151,6 +186,10 @@ void AudioBus::Remove(obs_source_t *input)
 	std::lock_guard<std::mutex> lock(mutex_);
 	for (auto it = inputs_.begin(); it != inputs_.end(); ++it)
 		if (it->source == input) {
+			{
+				std::lock_guard<std::mutex> pl(g_peakMutex);
+				g_peaks.erase(it->source);
+			}
 			obs_source_release(it->source);
 			inputs_.erase(it);
 			return;
@@ -291,11 +330,33 @@ bool AudioBus::Render(uint64_t *tsOut, obs_source_audio_mix *out, uint32_t mixer
 
 	uint64_t timestamp = 0;
 	for (Input &in : inputs_) {
-		if (obs_source_audio_pending(in.source))
+		if (SelfRendering(in.source) || obs_source_audio_pending(in.source))
 			continue;
 		const uint64_t t = obs_source_get_audio_timestamp(in.source);
 		if (t && (!timestamp || t < timestamp))
 			timestamp = t;
+	}
+	if (clock_) {
+		/* feed the clock one silent tick; its timestamp is the start of the tick */
+		static thread_local float silence[N] = {};
+		const uint64_t dur = util_mul_div64(N, 1000000000ULL, sampleRate);
+		const uint64_t now = os_gettime_ns();
+		if (!clockNext_ || clockNext_ + 500000000ULL < now || clockNext_ > now + 500000000ULL)
+			clockNext_ = now;
+		obs_source_audio a = {};
+		a.data[0] = a.data[1] = reinterpret_cast<const uint8_t *>(silence);
+		a.frames = (uint32_t)N;
+		a.speakers = SPEAKERS_STEREO;
+		a.format = AUDIO_FORMAT_FLOAT_PLANAR;
+		a.samples_per_sec = (uint32_t)sampleRate;
+		a.timestamp = clockNext_;
+		clockNext_ += dur;
+		obs_source_output_audio(clock_, &a);
+		if (!obs_source_audio_pending(clock_)) {
+			const uint64_t t = obs_source_get_audio_timestamp(clock_);
+			if (t && (!timestamp || t < timestamp))
+				timestamp = t;
+		}
 	}
 	const bool haveSound = timestamp != 0;
 	if (!haveSound && lastTs_) /* no input has sound now: the held tick still has to go out */
@@ -357,8 +418,9 @@ bool AudioBus::Render(uint64_t *tsOut, obs_source_audio_mix *out, uint32_t mixer
 		const bool pending = obs_source_audio_pending(in.source);
 		const bool audible = !((startGain == 0.0f && g == 0.0f) || (startAuto == 0.0f && a == 0.0f));
 		if (haveSound && !pending && audible && (in.routes || !in.sinks.empty())) {
-			const uint64_t t = obs_source_get_audio_timestamp(in.source);
-			if (t) {
+			const bool self = SelfRendering(in.source);
+			const uint64_t t = self ? timestamp : obs_source_get_audio_timestamp(in.source);
+			if (t && t >= timestamp) {
 				offset = (size_t)util_mul_div64(t - timestamp, sampleRate, 1000000000ULL);
 				if (offset < N) {
 					/* the input's own sound (fader applied) is in mix 0, which is always prepared */
@@ -373,6 +435,16 @@ bool AudioBus::Render(uint64_t *tsOut, obs_source_audio_mix *out, uint32_t mixer
 					if (ch == 1)
 						cur[1] = cur[0];
 					present = true;
+					if (self) {
+						float peak = 0.0f;
+						for (size_t c = 0; c < ch; c++)
+							if (const float *src = mix.output[0].data[c])
+								for (size_t i = 0; i < N; i++)
+									peak = std::max(peak, std::fabs(src[i]));
+						std::lock_guard<std::mutex> pl(g_peakMutex);
+						float &pk = g_peaks[in.source];
+						pk = std::max(pk, peak);
+					}
 					if (offset) /* sound starting inside the tick: soft start */
 						for (size_t i = 0; i < kEdge && offset + i < N; i++)
 							for (auto &c : cur)

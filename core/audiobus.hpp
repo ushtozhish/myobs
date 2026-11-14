@@ -44,6 +44,13 @@ public:
 	virtual void Push(const float *l, const float *r, size_t frames) = 0; /* engine audio thread */
 };
 
+/* A source has sound for the router: a normal audio source, or a composite that renders its own
+ * sound tick by tick (the clip: its sound bypasses the libobs queue, which dropped pieces of it). */
+inline bool SourceHasAudio(obs_source_t *s)
+{
+	return s && (obs_source_get_output_flags(s) & (OBS_SOURCE_AUDIO | OBS_SOURCE_COMPOSITE)) != 0;
+}
+
 class AudioBus {
 public:
 	AudioBus();
@@ -78,6 +85,10 @@ public:
 
 	// Tests: log every input's part of the tick when the Мастер-стрим mix jumps by more than this (0 = off).
 	static void SetDebugStep(float threshold);
+
+	// Meter for inputs that render their own sound (libobs meters see only queued sound):
+	// highest linear peak (after the fader) since the last call, 0 if none.
+	static float TakeInputPeak(obs_source_t *input);
 
 	// Called by the router source (audio thread).
 	bool Render(uint64_t *tsOut, obs_source_audio_mix *out, uint32_t mixers, size_t channels, size_t sampleRate);
@@ -117,6 +128,8 @@ private:
 	std::map<std::string, Sink> sinks_;
 	obs_source_t *program_ = nullptr;
 	obs_source_t *incoming_ = nullptr;
+	obs_source_t *clock_ = nullptr; // silent queued source: its timestamp is the start of the tick
+	uint64_t clockNext_ = 0;
 	uint64_t lastTs_ = 0; // timestamp of the last tick output (a tick with no input sound still goes out)
 };
 

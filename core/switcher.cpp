@@ -113,7 +113,7 @@ bool Switcher::HasAudio(int index) const
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	return index >= 0 && index < (int)sources_.size() &&
-	       (obs_source_get_output_flags(sources_[index]) & OBS_SOURCE_AUDIO) != 0;
+	       SourceHasAudio(sources_[index]);
 }
 
 void Switcher::SetAudioRoute(int index, int bus, bool on)
